@@ -37,8 +37,11 @@ Overall, this code makes the ESP8266 a flexible and user-friendly tool for smart
 MQTT messages can be sent to control the LEDs with the following format:
 
 Static mode: 0,255,100,FF0000 - Mode 0, full brightness, speed 100, red color.
+
 Blink mode: 1,128,200,00FF00 - Mode 1, half brightness, speed 200, green color.
+
 Turn off LEDs: stop
+
 Segment control: segment,0,2,255,100,FF0000 - LED 0, mode 2, full brightness, speed 100, red color.
 
 See https://github.com/kitesurfer1404/WS2812FX GitHub page for more payload examples.
