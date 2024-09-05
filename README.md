@@ -1,3 +1,10 @@
+Circuit board:
+https://oshwlab.com/s53zo/pingpong-lucke
+
+Short description:
+This code configures an ESP8266 microcontroller to connect to WiFi, host a web interface for setup, control WS2812 LEDs, and communicate with an MQTT server for remote commands. It allows users to easily configure network settings, update firmware over the air, and manage LED lighting effects remotely through MQTT, making it ideal for smart home applications and IoT projects. The device automatically handles reconnections and offers power-saving features by turning off LEDs when not in use.
+
+Longer description:
 This code transforms an ESP8266 microcontroller, I use NodeMCU 0.9, into a smart WiFi and LED controller with MQTT integration. Here's what it does:
 
 1. **WiFi Configuration and Setup:**
