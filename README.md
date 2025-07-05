@@ -4,7 +4,7 @@ Of course\! Here is a `readme.md` file for your GitHub project, generated based 
 
 # ESP8266 MQTT Antenna & LED Controller
 
-This project provides a flexible and configurable solution for controlling an antenna system and a WS2812B LED strip via MQTT. It is designed to be used in a radio amateur context (inspired by S53ZO's setup), where it dynamically receives antenna availability for different bands and allows for selection.
+This project provides a flexible and configurable solution for controlling an antenna system and a WS2812B LED strip via MQTT. It is designed to be used in a radio amateur context (inspired by S53M's setup), where it dynamically receives antenna availability for different bands and allows for selection.
 
 The device is built on an ESP8266, configurable via a web interface, and supports Over-the-Air (OTA) updates.
 
