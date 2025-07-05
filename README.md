@@ -1,47 +1,114 @@
-Circuit board:
-https://oshwlab.com/s53zo/pingpong-lucke
+Of course\! Here is a `readme.md` file for your GitHub project, generated based on the code you provided.
 
-Short description:
-This code configures an ESP8266 microcontroller to connect to WiFi, host a web interface for setup, control WS2812 LEDs, and communicate with an MQTT server for remote commands. It allows users to easily configure network settings, update firmware over the air, and manage LED lighting effects remotely through MQTT, making it ideal for smart home applications and IoT projects. The device automatically handles reconnections and offers power-saving features by turning off LEDs when not in use.
+-----
 
-Longer description:
-This code transforms an ESP8266 microcontroller, I use NodeMCU 0.9, into a smart WiFi and LED controller with MQTT integration. Here's what it does:
+# ESP8266 MQTT Antenna & LED Controller
 
-1. **WiFi Configuration and Setup:**
-   - When you first power on the device, it either connects to your existing WiFi network or sets up its own WiFi network (called "ESP8266_Setup") if it can't connect.
-   - You can connect to this network from your phone or computer and access a setup page at the default IP address.
+This project provides a flexible and configurable solution for controlling an antenna system and a WS2812B LED strip via MQTT. It is designed to be used in a radio amateur context (inspired by S53ZO's setup), where it dynamically receives antenna availability for different bands and allows for selection.
 
-2. **Web Interface for Configuration:**
-   - The device hosts a simple web page where you can enter your WiFi network name (SSID), password, and MQTT server details (IP address and port).
-   - Once you submit this information, the device saves it and restarts to connect to your specified network and MQTT server.
+The device is built on an ESP8266, configurable via a web interface, and supports Over-the-Air (OTA) updates.
 
-3. **LED Control through MQTT:**
-   - The ESP8266 controls a strip of WS2812 LEDs, allowing you to change the colors, brightness, and patterns through MQTT messages.
-   - You can send specific commands like turning the LEDs on and off, changing colors, or setting them to blink in different patterns via an MQTT topic.
+## ✨ Features
 
-4. **Over-the-Air (OTA) Firmware Updates:**
-   - The device supports OTA updates, meaning you can upload new firmware directly through the web interface without needing a physical connection.
+  * **Web-Based Configuration**: No need to hardcode credentials. The ESP8266 hosts a web portal to configure WiFi, MQTT broker details, and a station name.
+  * **AP Fallback Mode**: If the configured WiFi is unavailable, the device starts an Access Point (`ESP8266_Setup`) to allow for initial setup or reconfiguration.
+  * **Dynamic Antenna Management**: Subscribes to an MQTT topic that provides a JSON list of available antennas and their supported bands.
+  * **Natural Alphanumeric Sorting**: Correctly sorts antenna names like "A1", "A2", "A10", "A-H".
+  * **Band-Aware Antenna Lists**: Responds to MQTT messages about the current operating band and prepares a corresponding list of available antennas.
+  * **MQTT & Serial Control**:
+      * Control WS2812FX LED effects via MQTT commands.
+      * Select antennas using simple numeric commands over the USB serial port.
+  * **Status LEDs**: Uses a WS2812B LED strip to provide visual feedback on WiFi/MQTT connection status and a "hello" animation on boot.
+  * **OTA Updates**: A built-in web page allows for easy firmware updates over WiFi.
+  * **Persistent Configuration**: Saves all settings to EEPROM.
+  * **Remote Debugging**: Publishes detailed debug messages to a dedicated MQTT topic.
 
-5. **Automatic LED Turn-Off:**
-   - If you don't send any LED commands for 60 minutes, the device will automatically turn off the LEDs to save power.
+## ⚙️ Hardware Requirements
 
-6. **Feedback and Status:**
-   - The device provides feedback over MQTT and through the web interface, so you always know if your commands are received and executed.
-   - It also periodically sends "Alive" messages to let you know it’s still connected and functioning.
+  * An ESP8266-based board (e.g., NodeMCU, Wemos D1 Mini).
+  * A WS2812B addressable LED strip (configured for 4 LEDs by default).
+  * A suitable 5V power supply for the ESP8266 and the LED strip.
 
-7. **Built-in Reconnect and Recovery:**
-   - If the device loses its connection to the WiFi or MQTT server, it automatically tries to reconnect. If it can't connect to WiFi, it goes back into setup mode, making it easy to reconfigure.
+## 📚 Libraries Used
 
-Overall, this code makes the ESP8266 a flexible and user-friendly tool for smart home projects, particularly those involving LED lighting and remote control through WiFi and MQTT.
+This project relies on the following Arduino libraries:
 
-MQTT messages can be sent to control the LEDs with the following format:
+  * `ESP8266WiFi`
+  * `ESP8266WebServer`
+  * `ESP8266HTTPUpdateServer`
+  * `PubSubClient` (v2.8.0 or compatible, with `MQTT_MAX_PACKET_SIZE` increased)
+  * `EEPROM`
+  * `WS2812FX`
+  * `ArduinoJson` (v6 or compatible)
 
-Static mode: 0,255,100,FF0000 - Mode 0, full brightness, speed 100, red color.
+## 🚀 Setup and Configuration
 
-Blink mode: 1,128,200,00FF00 - Mode 1, half brightness, speed 200, green color.
+1.  **Flash Firmware**: Compile and upload the sketch to your ESP8266 board using the Arduino IDE or PlatformIO.
+2.  **Connect to AP**: On its first boot or if it fails to connect to a saved network, the device will create a WiFi Access Point with the SSID: **`ESP8266_Setup`**. Connect your computer or phone to this network.
+3.  **Open Web Portal**: Once connected, open a web browser and navigate to `http://192.168.4.1`.
+4.  **Enter Details**: You will see a configuration page. Fill in your:
+      * WiFi SSID & Password
+      * MQTT Server IP & Port
+      * Station Name (e.g., `RTX-01`)
+5.  **Save and Reboot**: Click "Save & Reboot". The device will restart and attempt to connect to your WiFi network and MQTT broker.
 
-Turn off LEDs: stop
+## 📡 MQTT Protocol
 
-Segment control: segment,0,2,255,100,FF0000 - LED 0, mode 2, full brightness, speed 100, red color.
+The device uses a structured set of MQTT topics for operation. The `<mac_address>` is the device's MAC address (e.g., `AA:BB:CC:DD:EE:FF`), and the `<station_name>` is the name you configured in the web portal.
 
-See https://github.com/kitesurfer1404/WS2812FX GitHub page for more payload examples.
+### Subscribed Topics
+
+The device listens for messages on the following topics:
+
+  * **`matrigs/0/sta/<station_name>/available`**
+      * **Purpose**: To receive the master list of all available antennas. The payload should be a JSON object where keys are antenna names.
+      * **Example Payload**:
+        ```json
+        {
+          "A1-V": { "80m": ["RX"], "40m": ["RX","TX"] },
+          "A2-H": { "40m": ["RX"], "20m": ["TX"] },
+          "LOAD-2KA": { "80m": ["TX"], "40m": ["TX"] }
+        }
+        ```
+  * **`matrigs/0/dt/RTX/d/<station_name>`**
+      * **Purpose**: To inform the device of the current operating band.
+      * **Example Payload**:
+        ```json
+        { "BANDS": "40m", "TARGET": { "RXTX": "RX" } }
+        ```
+  * **`pingpong/<mac_address>/fxcmd`**
+      * **Purpose**: To control the WS2812FX LED strip.
+      * **Payloads**:
+          * `stop`: Turns the LEDs off.
+          * `<mode>,<brightness>,<speed>,<color_hex>`: Sets a standard effect. Example: `1,128,200,00FF00` for a medium-speed green blink.
+          * `segment,<pixel>,<mode>,<bright>,<speed>,<color_hex>`: Controls a single pixel. Example: `segment,0,0,255,0,FF0000` to set the first pixel to static red.
+
+### Published Topics
+
+The device publishes messages to the following topics:
+
+  * **`matrigs/0/sta/<station_name>/b/<band>/p:set/[RX|TX]ANTENNAS`**
+      * **Purpose**: Publishes the chosen antenna after a selection is made via the serial interface.
+      * **Example Payload**: `["A1-V"]`
+  * **`pingpong/<mac_address>/debug`**
+      * **Purpose**: Publishes verbose logs about its state and received messages. This can be enabled/disabled via the serial interface.
+  * **`pingpong/<mac_address>/fxresp`**
+      * **Purpose**: Publishes a "hello" message on successful MQTT connection.
+
+## 💻 Serial Interface
+
+Connect to the ESP8266 using a serial monitor at **115200 baud**. The following commands are available:
+
+  * `debug`: Enables publishing verbose logs to the `.../debug` MQTT topic. (Enabled by default for the first 60 seconds after boot).
+  * `stop`: Disables publishing debug logs.
+  * `<number>` (e.g., `1`, `2`): Selects an antenna from the currently active list.
+      * `0`: A special command to always select the `LOAD-2KA` antenna.
+      * `1`, `2`, `3`...: Selects the corresponding antenna from the sorted list for the current band (e.g., `1` selects the first antenna in the list).
+
+The current antenna list is printed to the serial monitor when the band changes.
+
+## 📂 Project Files
+
+  * **`[sketch_name].ino`**: The main sketch containing `setup()` and `loop()`. It handles WiFi, the web server, OTA updates, and MQTT connection logic.
+  * **`antenna_mqtt_handler.h`**: Header file for the antenna data processing module.
+  * **`antenna_mqtt_handler.cpp`**: Implementation for parsing, storing, and sorting antenna information received from MQTT. It contains the core logic for managing antenna lists based on the current band.
