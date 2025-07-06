@@ -412,61 +412,84 @@ void processSegmentCommand(const char* msg)
  * ===============================================================*/
 void callback(char* topic, byte* payload, unsigned int length)
 {
-    /* copy payload into a zero-terminated buffer ---------------- */
-    static const size_t MQTT_BUF_LEN = 2048;      // holds up to ≈2 kB JSON
+    /* ---------- copy MQTT payload into NUL-terminated buffer ------ */
+    static const size_t MQTT_BUF_LEN = 2048;          // ≈2 kB
     static char msg[MQTT_BUF_LEN];
 
-    if (length >= MQTT_BUF_LEN) {                 // still too big? bail out
-        Serial.printf("[MQTT] ⚠ oversized payload (%u bytes) – ignored\n", length);
+    if (length >= MQTT_BUF_LEN) {                     // still too big
+        Serial.printf("[MQTT] ⚠ oversized payload (%u bytes) – ignored\n",
+                      length);
         return;
     }
     memcpy(msg, payload, length);
     msg[length] = '\0';
 
-    /* make a writable copy of the topic string ------------------ */
+    /* ---------- make a writable copy of the topic string ---------- */
     char topicCopy[160];
     strncpy(topicCopy, topic, sizeof(topicCopy) - 1);
     topicCopy[sizeof(topicCopy) - 1] = '\0';
 
-    bool handled = false;      // for optional debug at the end
+    bool handled = false;                             // fall-through flag
 
-    /* ---- “…/sta/<sta>/available” ----------------------------- */
+    /* --------------------------------------------------------------
+     *  1. “…/sta/<station>/available”
+     * -------------------------------------------------------------*/
     if (strcmp(topicCopy, topic_available) == 0) {
         handleAvailableJSON(msg);
         handled = true;
     }
 
-    /* ---- “…/dt/<sta>/current” (legacy) ----------------------- */
+    /* --------------------------------------------------------------
+     *  2. legacy “…/dt/RTX/d/<station>”
+     * -------------------------------------------------------------*/
     else if (strcmp(topicCopy, topic_dt) == 0) {
         handleCurrentBandJSON(msg);
         handled = true;
     }
 
-    /* ---- “…/sta/<sta>/b/<Band>” per-band live JSON ----------- */
+    /* --------------------------------------------------------------
+     *  3. per-band live JSON “…/sta/<station>/b/<Band>”
+     * -------------------------------------------------------------*/
     else if (strncmp(topicCopy, topic_band_prefix,
                      strlen(topic_band_prefix)) == 0) {
 
-        /* bandTok points to the chars right after “…/b/” */
-        const char* bandTok = topicCopy + strlen(topic_band_prefix);
+        const char* bandTok = topicCopy + strlen(topic_band_prefix);  // "B80…"
+        const char* slash   = strchr(bandTok, '/');
 
-        /* the pure band topic has no further ‘/’ */
-        const char* slash = strchr(bandTok, '/');
-        if (!slash) {
+        if (!slash) {                          // base topic only
             handleBandStateJSON(bandTok, msg);
             handled = true;
         }
     }
 
-    /* ---- unknown / unhandled topic? -------------------------- */
+    /* --------------------------------------------------------------
+     *  4. LED FX commands  pingpong/<MAC>/fxcmd
+     * -------------------------------------------------------------*/
+    else if (strcmp(topicCopy, command_topic) == 0) {
+
+        if (strcmp(msg, "stop") == 0) {                    // simple stop
+            ws2812fx.stop();
+            ws2812fx.clear();
+            publishDebugMessage("[FX] 📴 stop");
+        }
+        else if (strncmp(msg, "segment,", 8) == 0) {       // advanced
+            processSegmentCommand(msg);
+        }
+        else {                                             // standard
+            processFxCommand(msg);
+        }
+        handled = true;
+    }
+
+    /* --------------------------------------------------------------
+     *  5. unknown / unhandled topic
+     * -------------------------------------------------------------*/
     if (!handled) {
         char dbg[192];
         snprintf(dbg, sizeof(dbg), "[MQTT] ⏭ ignored topic %s", topicCopy);
         publishDebugMessage(dbg);
     }
 }
-
-
-
 
 // --- MQTT reconnect ---
 void reconnectMQTT() {
