@@ -36,8 +36,17 @@ char feedback_topic[64] = "";
 char debug_topic[64]    = "";
 char currentRXTX[4] = "RX";     
 
+char topic_band_prefix[64];      // NEW: "matrigs/0/sta/<sta>/b/"
+char topic_band_wildcard[64];    // NEW: "…/b/#"
+
 bool        mqttHelloRunning = false;
 unsigned long mqttHelloStart = 0;
+
+/* ---------- live TX/RX flag (true = PTT active) --------------- */
+bool g_txActive = false;
+
+/* ---------- pending TX change instance ------------------------ */
+PendingTxChange g_pendingTx = { "", "", "", false };
 
 
 
@@ -55,7 +64,6 @@ std::map<String,String> bandCache;    // band ➜ sorted antenna list
 char topic_cmd[128];
 char topic_available[128];
 char topic_dt[128];
-
 
 // -----------------------------------------------------------------
 //  Debug helper – only speaks when debugEnabled == true
@@ -203,46 +211,97 @@ void handleSave() {
 }
 
 // --- WiFi Setup ---
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);            // station only
-  WiFi.begin(ssid, password);
-  Serial.printf("Connecting to WiFi: %s …\n", ssid);
+/* ================================================================
+ *  Bring up Wi-Fi, then build all MQTT topics & subscribe
+ * ===============================================================*/
+void setupWiFi()
+{
+    delay(10);
+    Serial.println();
+    Serial.printf("Connecting to \"%s\" …\n", ssid);
 
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { // 15 s
-    delay(100);
-    yield();                     // feed watchdog
-    Serial.print('.');
-  }
-  Serial.println();
+    /* ---------- Wi-Fi in STA mode ----------------------------------- */
+    WiFi.mode(WIFI_STA);
+#if defined(ESP32)
+    WiFi.setHostname(station_name);
+#else
+    WiFi.hostname(station_name);
+#endif
+    WiFi.begin(ssid, password);
 
-  if (WiFi.status() == WL_CONNECTED) {
+    /* ---------- wait up to 30 s for a connection -------------------- */
+    const uint32_t CONNECT_TIMEOUT_MS = 30'000;
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - t0 < CONNECT_TIMEOUT_MS) {
+        delay(500);
+        Serial.print('.');
+    }
+
+    /* ---------- fall back to AP if still not connected -------------- */
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nTimeout – starting AP fallback");
+        setupAP();                                // your existing helper
+        return;                                   // skip the rest
+    }
+
+    /* ---------- success! ------------------------------------------- */
+    Serial.println();
     Serial.print("Connected! IP = ");
-    String macStr = WiFi.macAddress();                 // "AA:BB:CC:DD:EE:FF"
-    macStr.toCharArray(macAddress, sizeof(macAddress));
-
-    snprintf(command_topic,  sizeof(command_topic),
-            "pingpong/%s/fxcmd",  macAddress);
-    snprintf(feedback_topic, sizeof(feedback_topic),
-            "pingpong/%s/fxresp", macAddress);
-    snprintf(debug_topic,    sizeof(debug_topic),
-            "pingpong/%s/debug",  macAddress);
-    snprintf(topic_cmd,       sizeof(topic_cmd), "pingpong/%s/fxcmd",   macAddress);
-    snprintf(topic_available, sizeof(topic_available),
-         "matrigs/0/sta/%s/available", station_name);
-    snprintf(topic_dt,        sizeof(topic_dt),
-         "matrigs/0/dt/RTX/d/%s",      station_name);
-
-
-  Serial.print("Command topic: ");  Serial.println(command_topic);
-  Serial.print("Feedback topic: "); Serial.println(feedback_topic);
-  Serial.print("Debug topic: ");    Serial.println(debug_topic);
     Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Timeout – starting AP fallback");
-    setupAP();                   // creates ESP8266_Setup if STA failed
-  }
+
+    /* ---------- MAC address as ASCII “AA:BB:CC:DD:EE:FF” ----------- */
+#if defined(ESP32)
+    uint8_t rawMac[6];
+    WiFi.macAddress(rawMac);                      // fill 6-byte array
+    snprintf(macAddress, sizeof(macAddress),
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             rawMac[0], rawMac[1], rawMac[2],
+             rawMac[3], rawMac[4], rawMac[5]);
+#else                                             // ESP8266
+    String macStr = WiFi.macAddress();            // returns String
+    macStr.toCharArray(macAddress, sizeof(macAddress));
+#endif
+
+    /* ---------- build MQTT topic strings --------------------------- */
+    snprintf(command_topic,  sizeof(command_topic),
+             "pingpong/%s/fxcmd",  macAddress);
+    snprintf(feedback_topic, sizeof(feedback_topic),
+             "pingpong/%s/fxresp", macAddress);
+    snprintf(debug_topic,    sizeof(debug_topic),
+             "pingpong/%s/debug",  macAddress);
+
+    snprintf(topic_available, sizeof(topic_available),
+             "matrigs/0/sta/%s/available", station_name);
+
+    snprintf(topic_dt, sizeof(topic_dt),          // ← correct legacy feed
+             "matrigs/0/dt/RTX/d/%s", station_name);
+
+    snprintf(topic_band_prefix, sizeof(topic_band_prefix),
+             "matrigs/0/sta/%s/b/", station_name);
+    snprintf(topic_band_wildcard, sizeof(topic_band_wildcard),
+             "%s#", topic_band_prefix);
+
+    /* ---------- subscribe ----------------------------------------- */
+    client.subscribe(command_topic);              // if broker echoes cmds
+    client.subscribe(topic_available);            // antenna catalogue
+    client.subscribe(topic_dt);                   // legacy combined status
+    client.subscribe(topic_band_wildcard);        // live per-band JSON
+
+    /* ---------- console summary ----------------------------------- */
+    Serial.print("Command topic: ");  Serial.println(command_topic);
+    Serial.print("Feedback topic: "); Serial.println(feedback_topic);
+    Serial.print("Debug topic: ");    Serial.println(debug_topic);
+    Serial.print("Sub → ");           Serial.println(topic_available);
+    Serial.print("Sub → ");           Serial.println(topic_dt);
+    Serial.print("Sub → ");           Serial.println(topic_band_wildcard);
+
+#if defined(ARDUINO_ARCH_ESP32)
+    if (MDNS.begin(station_name))
+        Serial.println("[mDNS] responder started");
+#endif
 }
+
 
 // --- AP Mode Setup ---
 void setupAP() {
@@ -348,67 +407,64 @@ void processSegmentCommand(const char* msg)
 //  • All debug goes out *after* dispatch so handlers can safely
 //    publish to MQTT without recursion
 // ────────────────────────────────────────────────────────────────
+/* ================================================================
+ *  PubSubClient message callback
+ * ===============================================================*/
 void callback(char* topic, byte* payload, unsigned int length)
 {
-  /* ── 1️⃣  Safe copies (topic & payload) -------------------------- */
-  char topicCopy[128];
-  strncpy(topicCopy, topic, sizeof(topicCopy) - 1);
-  topicCopy[sizeof(topicCopy) - 1] = '\0';
+    /* copy payload into a zero-terminated buffer ---------------- */
+    static const size_t MQTT_BUF_LEN = 2048;      // holds up to ≈2 kB JSON
+    static char msg[MQTT_BUF_LEN];
 
-  /* guard: payload ≤ MQTT_MAX_PACKET_SIZE */
-  if (length >= MQTT_MAX_PACKET_SIZE) {
-      publishDebugMessage("[callback] ❌ Payload too big");
-      return;
-  }
-  char* msg = static_cast<char*>(malloc(length + 1));
-  if (!msg) { publishDebugMessage("[callback] ❌ malloc failed"); return; }
-  memcpy(msg, payload, length);
-  msg[length] = '\0';
+    if (length >= MQTT_BUF_LEN) {                 // still too big? bail out
+        Serial.printf("[MQTT] ⚠ oversized payload (%u bytes) – ignored\n", length);
+        return;
+    }
+    memcpy(msg, payload, length);
+    msg[length] = '\0';
 
-  bool handled = false;
+    /* make a writable copy of the topic string ------------------ */
+    char topicCopy[160];
+    strncpy(topicCopy, topic, sizeof(topicCopy) - 1);
+    topicCopy[sizeof(topicCopy) - 1] = '\0';
 
-  /* ── 2️⃣  Exact-match topic dispatch ------------------------------ */
-  extern char topic_available[];
-  extern char topic_dt[];
-  extern char topic_cmd[];
+    bool handled = false;      // for optional debug at the end
 
-  if (strcmp(topicCopy, topic_available) == 0) {
-      handleAvailableJSON(msg);
-      handled = true;
-  }
-  else if (strcmp(topicCopy, topic_dt) == 0) {
-      handleCurrentBandJSON(msg);
-      handled = true;
-  }
-  else if (strcmp(topicCopy, topic_cmd) == 0) {
-      /* ---- fxcmd sub-protocol ----------------------------------- */
-      if (strcmp(msg, "stop") == 0) {
-          ws2812fx.stop(); ws2812fx.clear();
-          publishDebugMessage("[FX] stop");
-      }
-      else if (strncmp(msg, "segment", 7) == 0) {
-          // reuse your existing segment-parsing block
-          processSegmentCommand(msg);          
-      }
-      else if (strchr(msg, ',') && isdigit((uint8_t)msg[0])) {
-          processFxCommand(msg);
-      }
-      else {
-          publishDebugMessage("[FX] unrecognised payload");
-      }
-      handled = true;
-  }
+    /* ---- “…/sta/<sta>/available” ----------------------------- */
+    if (strcmp(topicCopy, topic_available) == 0) {
+        handleAvailableJSON(msg);
+        handled = true;
+    }
 
-  /* ── 3️⃣  Post-dispatch debug (safe to publish) ------------------- */
-  snprintf(logBuffer, sizeof(logBuffer), "Topic: %s", topicCopy);
-  publishDebugMessage(logBuffer);
-  snprintf(logBuffer, sizeof(logBuffer),
-           "MQTT Payload: '%s'%s",
-           msg, handled ? "" : "  (UNHANDLED)");
-  publishDebugMessage(logBuffer);
+    /* ---- “…/dt/<sta>/current” (legacy) ----------------------- */
+    else if (strcmp(topicCopy, topic_dt) == 0) {
+        handleCurrentBandJSON(msg);
+        handled = true;
+    }
 
-  free(msg);
+    /* ---- “…/sta/<sta>/b/<Band>” per-band live JSON ----------- */
+    else if (strncmp(topicCopy, topic_band_prefix,
+                     strlen(topic_band_prefix)) == 0) {
+
+        /* bandTok points to the chars right after “…/b/” */
+        const char* bandTok = topicCopy + strlen(topic_band_prefix);
+
+        /* the pure band topic has no further ‘/’ */
+        const char* slash = strchr(bandTok, '/');
+        if (!slash) {
+            handleBandStateJSON(bandTok, msg);
+            handled = true;
+        }
+    }
+
+    /* ---- unknown / unhandled topic? -------------------------- */
+    if (!handled) {
+        char dbg[192];
+        snprintf(dbg, sizeof(dbg), "[MQTT] ⏭ ignored topic %s", topicCopy);
+        publishDebugMessage(dbg);
+    }
 }
+
 
 
 
@@ -455,84 +511,97 @@ void reconnectMQTT() {
   }
 }
 
+/* ================================================================
+ *  Read one line from USB-Serial and act on it.
+ *
+ *  • User types a single digit 0-9 + <Enter>.
+ *      0  →  hard-wired dummy load  ("LOAD-2KA")
+ *      1… →  entry n-1 of currentAntList (band-sorted list)
+ *
+ *  • If the target bank is RX  →  publish immediately
+ *    If the target bank is TX and PTT is active (g_txActive == true)
+ *      →  queue the change in g_pendingTx and wait until RTX returns to RX
+ *
+ *  • Publishes     p:remove/…ANTENNAS   (plain text old antenna)
+ *                  p:add/…ANTENNAS      (plain text new antenna)
+ * ===============================================================*/
 void handleSerialCommands()
 {
-  if (!Serial.available()) return;
+    /* ── nothing waiting? ────────────────────────────────────── */
+    if (!Serial.available()) return;
 
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();                                   // remove CR/LF
+    /* ── read one LF-terminated line and trim whitespace ─────── */
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (!cmd.length()) return;
 
-  /* ── debug on/off ───────────────────────────────────────────── */
-  if (cmd.equalsIgnoreCase("debug")) {
-      debugEnabled  = true;
-      debugDeadline = 0;
-      Serial.println(F("🟢 Debug messages ENABLED"));
-      return;
-  }
-  if (cmd.equalsIgnoreCase("stop")) {
-      debugEnabled  = false;
-      debugDeadline = 0;
-      Serial.println(F("🔴 Debug messages DISABLED"));
-      return;
-  }
+    /* ── quick-select: exactly one decimal digit 0-9 ─────────── */
+    if (cmd.length() != 1 || !isDigit(cmd[0])) {
+        Serial.println(F("[Serial] ❓ Unrecognised command – try a digit 0-9"));
+        return;
+    }
 
-  /* ── antenna quick-select (single digit) ───────────────────── */
-  if (cmd.length() == 1 && isDigit(cmd[0])) {
+    int idx = cmd[0] - '0';
 
-      /* robust parse: distinguish “0” from invalid */
-      char* endPtr;
-      long  v = strtol(cmd.c_str(), &endPtr, 10);
-      if (*endPtr != '\0' || v < 0 || v > 9) {
-          Serial.println(F("[Serial] Invalid number"));
-          return;
-      }
-      int idx = (int)v;
+    /* ── map digit to antenna name ───────────────────────────── */
+    String chosen;
+    if (idx == 0) {                                    // dummy-load shortcut
+        chosen = F("LOAD-2KA");
+    } else if (idx <= (int)currentAntList.size()) {
+        chosen = currentAntList[idx - 1];              // 1-based → 0-based
+    } else {
+        Serial.printf("[SerialSelect] Invalid antenna number %d\n", idx);
+        return;
+    }
 
-      extern std::vector<String> currentAntList;
-      extern PubSubClient        client;
-      extern char                station_name[];
-      extern String              currentBand;
-      extern char                currentRXTX[];
+    Serial.printf("[SerialSelect] %s band=%s → %s\n",
+                  currentRXTX, currentBand.c_str(), chosen.c_str());
 
-      String chosen;
-      if (idx == 0) {                             // always LOAD-2KA
-          chosen = F("LOAD-2KA");
-      } else if (idx <= (int)currentAntList.size()) {
-          String candidate = currentAntList[idx - 1];
-          if (candidate != F("LOAD-2KA"))         // prevent alias
-              chosen = candidate;
-      }
+    /* ── figure out what is currently active in this bank ───── */
+    BandState  curState   = g_bandStates[currentBand];
+    String     currentSel = (currentRXTX[0] == 'R') ? curState.rx
+                                                    : curState.tx;
 
-      if (chosen.length()) {
-          char buf[160];
-          snprintf(buf, sizeof(buf),
-                   "[SerialSelect] Antenna %d → %s", idx, chosen.c_str());
-          Serial.println(buf);
-          publishDebugMessage(buf);
+    /* ── 1.  TX bank + PTT active  →  queue the change ───────── */
+    if (currentRXTX[0] == 'T' && g_txActive) {
+        g_pendingTx.band   = currentBand;
+        g_pendingTx.oldAnt = currentSel;
+        g_pendingTx.newAnt = chosen;
+        g_pendingTx.valid  = true;
 
-          /* publish to set/TXANTENNAS or set/RXANTENNAS */
-          if (client.connected()) {
-              char topic[128];
-              snprintf(topic, sizeof(topic),
-                       "matrigs/0/sta/%s/b/%s/p:set/%sANTENNAS",
-                       station_name, currentBand.c_str(), currentRXTX);
+        publishDebugMessage("[TX-Queue] 💤 queued until RTX returns to RX");
+        return;                                         // nothing published now
+    }
 
-              char payload[80];
-              snprintf(payload, sizeof(payload), "[\"%s\"]", chosen.c_str());
+    /* ── 2.  publish immediately (RX bank, or TX while in RX) ─ */
+    if (!client.connected()) {
+        publishDebugMessage("[SerialSelect] ⚠ MQTT not connected");
+    } else if (currentSel == chosen) {
+        publishDebugMessage("[SerialSelect] 🔄 already active");
+    } else {
+        
+        /* 2️⃣ add new ----------------------------------------- */
+        char topicA[128];
+        snprintf(topicA, sizeof(topicA),
+                 "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
+                 station_name, currentBand.c_str(), currentRXTX);
+        client.publish(topicA, chosen.c_str());
 
-              client.publish(topic, payload);
-          }
+        /* 1️⃣ remove current (if any) -------------------------- */
+        if (currentSel.length()) {
+            char topicR[128];
+            snprintf(topicR, sizeof(topicR),
+                     "matrigs/0/sta/%s/b/%s/p:remove/%sANTENNAS",
+                     station_name, currentBand.c_str(), currentRXTX);
+            client.publish(topicR, currentSel.c_str());
+        }
+    }
 
-          // TODO: add GPIO / relay switching here
-
-      } else {
-          Serial.println(F("[SerialSelect] Invalid antenna number"));
-      }
-      return;
-  }
-
-  /* ── everything else ───────────────────────────────────────── */
-  Serial.println(F("[Serial] Unknown command"));
+    /* ── 3.  update local cache so the next change is correct ─ */
+    if (currentRXTX[0] == 'R')
+        g_bandStates[currentBand].rx = chosen;
+    else
+        g_bandStates[currentBand].tx = chosen;
 }
 
 
