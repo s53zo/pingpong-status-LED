@@ -548,6 +548,11 @@ void reconnectMQTT() {
  *  • Publishes     p:remove/…ANTENNAS   (plain text old antenna)
  *                  p:add/…ANTENNAS      (plain text new antenna)
  * ===============================================================*/
+/* ================================================================
+ *  handleSerialCommands()
+ *  • utility text commands:  debug, stop
+ *  • quick-select digit 0-9  →  antenna switch / queue
+ * ===============================================================*/
 void handleSerialCommands()
 {
     /* ── nothing waiting? ────────────────────────────────────── */
@@ -556,9 +561,30 @@ void handleSerialCommands()
     /* ── read one LF-terminated line and trim whitespace ─────── */
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    if (!cmd.length()) return;
+    if (!cmd.length()) return;                // empty line
 
-    /* ── quick-select: exactly one decimal digit 0-9 ─────────── */
+    /* ----------------------------------------------------------
+     *  textual utility commands
+     * ---------------------------------------------------------*/
+    if (cmd.equalsIgnoreCase("debug")) {
+        debugEnabled  = true;
+        debugDeadline = millis() + 60'000;    // auto-off in 1 min
+        Serial.println(F("🟢 Debug enabled for 1 minute"));
+        publishDebugMessage("[Serial] debug ON (1 min)");
+        return;
+    }
+
+    if (cmd.equalsIgnoreCase("stop")) {       // stop LED effects
+        ws2812fx.stop();
+        ws2812fx.clear();
+        Serial.println(F("[Serial] LEDs stopped"));
+        publishDebugMessage("[Serial] LEDs stopped via USB");
+        return;
+    }
+
+    /* ----------------------------------------------------------
+     *  quick-select: exactly one decimal digit 0-9
+     * ---------------------------------------------------------*/
     if (cmd.length() != 1 || !isDigit(cmd[0])) {
         Serial.println(F("[Serial] ❓ Unrecognised command – try a digit 0-9"));
         return;
@@ -566,12 +592,12 @@ void handleSerialCommands()
 
     int idx = cmd[0] - '0';
 
-    /* ── map digit to antenna name ───────────────────────────── */
+    /* map digit to antenna name -------------------------------- */
     String chosen;
-    if (idx == 0) {                                    // dummy-load shortcut
-        chosen = F("LOAD-2KA");
+    if (idx == 0) {
+        chosen = F("LOAD-2KA");               // dummy load
     } else if (idx <= (int)currentAntList.size()) {
-        chosen = currentAntList[idx - 1];              // 1-based → 0-based
+        chosen = currentAntList[idx - 1];     // 1-based → 0-based
     } else {
         Serial.printf("[SerialSelect] Invalid antenna number %d\n", idx);
         return;
@@ -580,37 +606,28 @@ void handleSerialCommands()
     Serial.printf("[SerialSelect] %s band=%s → %s\n",
                   currentRXTX, currentBand.c_str(), chosen.c_str());
 
-    /* ── figure out what is currently active in this bank ───── */
-    BandState  curState   = g_bandStates[currentBand];
-    String     currentSel = (currentRXTX[0] == 'R') ? curState.rx
-                                                    : curState.tx;
+    /* find currently active antenna in this bank --------------- */
+    BandState curState  = g_bandStates[currentBand];
+    String    currentSel = (currentRXTX[0] == 'R') ? curState.rx
+                                                   : curState.tx;
 
-    /* ── 1.  TX bank + PTT active  →  queue the change ───────── */
+    /* 1️⃣ TX bank & PTT active  →  queue change ---------------- */
     if (currentRXTX[0] == 'T' && g_txActive) {
         g_pendingTx.band   = currentBand;
         g_pendingTx.oldAnt = currentSel;
         g_pendingTx.newAnt = chosen;
         g_pendingTx.valid  = true;
-
         publishDebugMessage("[TX-Queue] 💤 queued until RTX returns to RX");
-        return;                                         // nothing published now
+        return;
     }
 
-    /* ── 2.  publish immediately (RX bank, or TX while in RX) ─ */
+    /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
     if (!client.connected()) {
         publishDebugMessage("[SerialSelect] ⚠ MQTT not connected");
     } else if (currentSel == chosen) {
         publishDebugMessage("[SerialSelect] 🔄 already active");
     } else {
-        
-        /* 2️⃣ add new ----------------------------------------- */
-        char topicA[128];
-        snprintf(topicA, sizeof(topicA),
-                 "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
-                 station_name, currentBand.c_str(), currentRXTX);
-        client.publish(topicA, chosen.c_str());
-
-        /* 1️⃣ remove current (if any) -------------------------- */
+        /* remove old (if any) */
         if (currentSel.length()) {
             char topicR[128];
             snprintf(topicR, sizeof(topicR),
@@ -618,14 +635,21 @@ void handleSerialCommands()
                      station_name, currentBand.c_str(), currentRXTX);
             client.publish(topicR, currentSel.c_str());
         }
+        /* add new */
+        char topicA[128];
+        snprintf(topicA, sizeof(topicA),
+                 "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
+                 station_name, currentBand.c_str(), currentRXTX);
+        client.publish(topicA, chosen.c_str());
     }
 
-    /* ── 3.  update local cache so the next change is correct ─ */
+    /* 3️⃣ update cache ----------------------------------------- */
     if (currentRXTX[0] == 'R')
         g_bandStates[currentBand].rx = chosen;
     else
         g_bandStates[currentBand].tx = chosen;
 }
+
 
 
 
