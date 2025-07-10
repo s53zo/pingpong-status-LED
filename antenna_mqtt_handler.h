@@ -4,38 +4,50 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <vector>
-#include <map>                      // NEW
+#include <map>
 
-/* ---------- data structures ------------------------------------ */
-struct BandState {                  // NEW
-    String rx;                      // first (or only) RXANTENNAS item
-    String tx;                      // first (or only) TXANTENNAS item
+// --- Data Structures ---
+// Represents the RX and TX antenna states for a specific band.
+struct BandState {
+    String rx; // The currently selected RX antenna for this band.
+    String tx; // The currently selected TX antenna for this band.
 };
 
-/* ---------- global caches -------------------------------------- */
-extern DynamicJsonDocument availableDoc;            // unchanged
-extern std::map<String, BandState> g_bandStates;    // NEW  (band ➜ state)
+// --- Global Caches (declared extern as they are defined in .cpp) ---
+// DynamicJsonDocument to store the parsed JSON from the ".../available" MQTT topic.
+extern DynamicJsonDocument availableDoc;
+// Map to store the BandState for each band (band name -> BandState).
+extern std::map<String, BandState> g_bandStates;
 
-/* ---------- MQTT-callback helpers ------------------------------ */
-void handleAvailableJSON(const char* json);         // “…/sta/<station>/available”
-void handleCurrentBandJSON(const char* json);       // legacy “…/dt/<station>/current”
+// --- MQTT Callback Handlers ---
+// Handles messages from the ".../sta/<station>/available" topic.
+void handleAvailableJSON(const char* json);
+// Handles messages from the legacy ".../dt/<station>/current" topic.
+void handleCurrentBandJSON(const char* json);
+// Handles messages from the new ".../sta/<sta>/b/<Band>" topic.
 void handleBandStateJSON(const char* band,
-                          const char* json);        // NEW “…/sta/<sta>/b/<Band>”
+                          const char* json);
 
-/* ---------- antenna helpers ------------------------------------ */
-std::vector<String> getCurrentAntList();            // returns {"A1-40", …}
-String listAntennasForBand(const char* band);       // "B80" → "A1-80 A3-80 …"
+// --- Antenna Helper Functions ---
+// Splits the `currentAntennas` string into a vector of individual antenna names.
+std::vector<String> getCurrentAntList();
+// Returns a space-separated string of sorted antennas available for a given band.
+String listAntennasForBand(const char* band);
 
-/* ---------------- shared TX-queue support -------------------- */
+// --- Shared TX-Queue Support ---
+// Structure to hold a pending TX antenna change, used for safe switching.
 struct PendingTxChange {
-    String band;
-    String oldAnt;
-    String newAnt;
-    bool   valid;
+    String band;   // The band for which the change is pending.
+    String oldAnt; // The antenna that was active before the pending change.
+    String newAnt; // The antenna to switch to once TX is inactive.
+    bool   valid;  // Flag indicating if there is a valid pending change.
 };
 
-extern bool            g_txActive;   // true while PTT is active
-extern PendingTxChange g_pendingTx;  // one queued TX change
-extern char            station_name[];
+// Flag indicating if the radio is currently transmitting (PTT active).
+extern bool g_txActive;
+// One queued TX change, used to prevent hot-switching during transmit.
+extern PendingTxChange g_pendingTx;
+// The station name, used for constructing MQTT topics.
+extern char station_name[];
 
-#endif  // ANTENNA_MQTT_HANDLER_H
+#endif // ANTENNA_MQTT_HANDLER_H

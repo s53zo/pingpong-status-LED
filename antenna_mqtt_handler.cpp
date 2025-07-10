@@ -1,9 +1,9 @@
 /**
- * antenna_mqtt_handler.cpp  –  MQTT helpers for antenna control
+ * antenna_mqtt_handler.cpp – MQTT helpers for antenna control
  * ------------------------------------------------------------------
  *  • Caches the latest “…/available” JSON (availableDoc)
- *  • Offers natural alphanumeric sorting:  A1 < A2 < A10 < A-BLAH
- *  • Provides quick look-ups:  listAntennasForBand("40m") → "A1-40 A3-40"
+ *  • Offers natural alphanumeric sorting: A1 < A2 < A10 < A-BLAH
+ *  • Provides quick look-ups: listAntennasForBand("40m") → "A1-40 A3-40"
  *  • Updates globals + publishes concise debug lines on band change
  */
 
@@ -17,94 +17,102 @@
 #include <map>
 #include <vector>
 
-/* ------------------------------------------------------------------
- *  Globals declared in the main sketch
- * ---------------------------------------------------------------- */
-extern PubSubClient              client;
-extern char                      currentRXTX[4];
-extern std::vector<String>       currentAntList;
-extern String                    currentBand;
-extern String                    currentAntennas;
-extern std::map<String, String>  bandCache;
-extern bool            g_txActive;
+// --- External Global Variables (from main sketch) ---
+// MQTT client instance.
+extern PubSubClient client;
+// Current radio state ("RX" or "TX").
+extern char currentRXTX[4];
+// List of antennas for the current band.
+extern std::vector<String> currentAntList;
+// Currently selected radio band.
+extern String currentBand;
+// Space-separated list of antennas for the current band.
+extern String currentAntennas;
+// Cache for band name -> sorted antenna list string.
+extern std::map<String, String> bandCache;
+// Flag indicating if the radio is currently transmitting (PTT active).
+extern bool g_txActive;
+// Structure to hold a pending TX antenna change.
 extern PendingTxChange g_pendingTx;
-extern char            station_name[];
+// Unique name for this station.
+extern char station_name[];
 
-
-/* Publish-to-MQTT debug helper (implemented in the sketch) */
+// --- External Debug Helper ---
+// Function to publish debug messages (defined in main sketch).
 extern void publishDebugMessage(const char* msg);
 
-/* Live antenna map cache (≈ 1 – 2 kB for your data set) */
+// --- Global Caches (defined here) ---
+// DynamicJsonDocument to store the parsed JSON from the ".../available" MQTT topic.
 DynamicJsonDocument availableDoc(4096);
+// Map to store the BandState for each band (band name -> BandState).
+std::map<String, BandState> g_bandStates;
 
-/* ── global: band ➜ {rx,tx} cache ─────────────────────────────── */
-std::map<String, BandState> g_bandStates; 
-
-
-
-
-
-/* ================================================================
- *  Helper: natural alphanumeric compare ("A1" < "A2" < "A10")
- * ===============================================================*/
+// -----------------------------------------------------------------
+//  naturalLess()
+//  Helper function for natural alphanumeric comparison of strings.
+//  (e.g., "A1" < "A2" < "A10").
+// -----------------------------------------------------------------
 static bool naturalLess(const String& a, const String& b)
 {
     const char* pa = a.c_str();
     const char* pb = b.c_str();
 
     while (*pa || *pb) {
-        /* skip non-alphanumerics like '-' or '_' */
+        // Skip non-alphanumeric characters like '-' or '_'.
         while (*pa && !isalnum(*pa)) ++pa;
         while (*pb && !isalnum(*pb)) ++pb;
 
-        if (!*pa || !*pb) break;           // one string ended
+        if (!*pa || !*pb) break; // One string ended.
 
-        /* numeric chunk? */
+        // If both are numeric chunks, compare as numbers.
         if (isdigit(*pa) && isdigit(*pb)) {
             long na = strtol(pa, (char**)&pa, 10);
             long nb = strtol(pb, (char**)&pb, 10);
             if (na != nb) return na < nb;
         }
-        /* alphabetic char */
+        // Otherwise, compare as alphabetic characters (case-insensitive).
         else {
             char ca = tolower(*pa++);
             char cb = tolower(*pb++);
             if (ca != cb) return ca < cb;
         }
     }
-    /* shorter string (after skipping separators) comes first */
+    // Shorter string (after skipping separators) comes first.
     return *pa == '\0' && *pb != '\0';
 }
 
-/* ------------------------------------------------------------------
- *  custom sort order
- *   0 : “A1-xxx”, “A3-xxx”, …  (all normal alphanumeric IDs)
- *   1 : A-HORLOOP
- *   2 : A-BEV…
- *  99 : LOAD-2KA   (always last)
- *  Within each bucket we keep the old naturalLess order.
- * -----------------------------------------------------------------*/
+// -----------------------------------------------------------------
+//  antennaRank()
+//  Assigns a rank to antenna names for custom sorting order.
+//  Specific antennas (LOAD, A-HORLOOP, A-BEV, A-INB) have higher ranks.
+// -----------------------------------------------------------------
 static int antennaRank(const String& s)
 {
-    if (s.startsWith(F("LOAD")))        return 99;     // last
-    if (s.startsWith(F("A-HORLOOP")))   return 1;
-    if (s.startsWith(F("A-BEV")))       return 2;
-    if (s.startsWith(F("A-INB")))       return 3;
-    return 0;                                           // default
+    if (s.startsWith(F("LOAD")))      return 99; // Always last.
+    if (s.startsWith(F("A-HORLOOP"))) return 1;
+    if (s.startsWith(F("A-BEV")))     return 2;
+    if (s.startsWith(F("A-INB")))     return 3;
+    return 0;                                     // Default rank for others.
 }
 
+// -----------------------------------------------------------------
+//  antennaLess()
+//  Custom comparison function for sorting antenna names.
+//  Sorts by rank first, then by natural alphanumeric order.
+// -----------------------------------------------------------------
 static bool antennaLess(const String& a, const String& b)
 {
     int ra = antennaRank(a);
     int rb = antennaRank(b);
-    if (ra != rb) return ra < rb;                       // rank first
-    return naturalLess(a, b);                           // then A1<A3<A10…
+    if (ra != rb) return ra < rb; // Compare by rank first.
+    return naturalLess(a, b);     // Then by natural alphanumeric order.
 }
 
-/* ================================================================
- *  Split the global currentAntennas ("A1-40 A3-40 …") into tokens
- *  and return them as std::vector<String>.
- * ===============================================================*/
+// -----------------------------------------------------------------
+//  getCurrentAntList()
+//  Splits the global `currentAntennas` string (e.g., "A1-40 A3-40 …")
+//  into individual tokens and returns them as a `std::vector<String>`.
+// -----------------------------------------------------------------
 std::vector<String> getCurrentAntList()
 {
     std::vector<String> list;
@@ -117,18 +125,21 @@ std::vector<String> getCurrentAntList()
         if (tok.length()) list.push_back(tok);
         pos = sp + 1;
     }
-    return list;                          // {"A1-40", "A3-40", …}
+    return list; // Returns example: {"A1-40", "A3-40", …}
 }
 
-/* ================================================================
- *  Build a (cached) space-separated antenna list for <band>
- * ===============================================================*/
+// -----------------------------------------------------------------
+//  listAntennasForBand()
+//  Builds a (cached) space-separated antenna list for a given band.
+//  Collects antennas from `availableDoc`, sorts them, and caches the result.
+// -----------------------------------------------------------------
 String listAntennasForBand(const char* band)
 {
+    // Check if the list is already in cache.
     auto it = bandCache.find(band);
-    if (it != bandCache.end()) return it->second;   // cache hit
+    if (it != bandCache.end()) return it->second; // Cache hit.
 
-    /* collect & sort */
+    // Collect and sort antenna names for the given band.
     std::vector<String> names;
     for (JsonPair kv : availableDoc.as<JsonObject>()) {
         JsonObject map = kv.value();
@@ -136,53 +147,61 @@ String listAntennasForBand(const char* band)
     }
     std::sort(names.begin(), names.end(), antennaLess);
 
-    /* join into one string */
+    // Join sorted names into a single space-separated string.
     String out;
     for (const auto& n : names) { out += n; out += ' '; }
     out.trim();
 
-    bandCache[band] = out;   // store in cache
+    bandCache[band] = out; // Store in cache.
     return out;
 }
 
-/* ── function: handle “…/sta/<sta>/b/<Band>” JSON  -------------- */
-void handleBandStateJSON(const char* band, const char* json)       // NEW
+// -----------------------------------------------------------------
+//  handleBandStateJSON()
+//  Handles JSON messages from the "…/sta/<sta>/b/<Band>" topic.
+//  Updates the `g_bandStates` map with the current RX/TX antennas for the band.
+// -----------------------------------------------------------------
+void handleBandStateJSON(const char* band, const char* json)
 {
     DynamicJsonDocument doc(512);
-    if (deserializeJson(doc, json)) return;          // bad JSON → ignore
+    if (deserializeJson(doc, json)) return; // Bad JSON, ignore.
 
-    BandState& st = g_bandStates[band];              // create or fetch slot
+    // Get or create the BandState entry for this band.
+    BandState& st = g_bandStates[band];
 
-    /* grab first element or reset to empty */
+    // Extract the first RXANTENNAS item or set to empty.
     if (doc["RXANTENNAS"].is<JsonArray>() && doc["RXANTENNAS"].size() > 0)
         st.rx = doc["RXANTENNAS"][0].as<const char*>();
     else
         st.rx = "";
 
+    // Extract the first TXANTENNAS item or set to empty.
     if (doc["TXANTENNAS"].is<JsonArray>() && doc["TXANTENNAS"].size() > 0)
         st.tx = doc["TXANTENNAS"][0].as<const char*>();
     else
         st.tx = "";
 
-    /* keep the public “currentBand” in sync so the UI stays sane */
+    // Keep the global `currentBand` in sync for UI consistency.
     extern String currentBand;
     currentBand = band;
 }
 
-/* ================================================================
- *  “…/sta/<station>/available”  →  update cache + pretty log
- * ===============================================================*/
+// -----------------------------------------------------------------
+//  handleAvailableJSON()
+//  Handles JSON messages from the "…/sta/<station>/available" topic.
+//  Updates the `availableDoc` cache and prints a pretty log to Serial.
+// -----------------------------------------------------------------
 void handleAvailableJSON(const char* json)
 {
-    availableDoc.clear();
-    bandCache.clear();
+    availableDoc.clear(); // Clear previous availability data.
+    bandCache.clear();    // Clear band cache as availability has changed.
 
     if (deserializeJson(availableDoc, json)) {
         publishDebugMessage("[handleAvailableJSON] ❌ JSON parse error");
         return;
     }
 
-    /* pretty print for Serial monitor (optional) */
+    // Pretty print for Serial monitor (optional).
     std::vector<String> ants;
     for (JsonPair kv : availableDoc.as<JsonObject>())
         ants.emplace_back(kv.key().c_str());
@@ -206,27 +225,29 @@ void handleAvailableJSON(const char* json)
     }
 }
 
-/* ================================================================
- *  “…/dt/<station>/current” handler (band + target RX/TX)
- * ===============================================================*/
+// -----------------------------------------------------------------
+//  handleCurrentBandJSON()
+//  Handles JSON messages from the legacy "…/dt/<station>/current" topic.
+//  Updates current band, antenna list, and handles queued TX changes.
+// -----------------------------------------------------------------
 void handleCurrentBandJSON(const char* json)
 {
     static String   lastBand = "?";
-    static uint32_t lastHash = 0;   // djb2-xor of antenna list
+    static uint32_t lastHash = 0; // djb2-xor hash of antenna list for deduplication.
 
-    /* parse the tiny status JSON */
+    // Parse the status JSON.
     DynamicJsonDocument doc(1024);
-    if (deserializeJson(doc, json)) return;       // bad JSON → ignore
+    if (deserializeJson(doc, json)) return; // Bad JSON, ignore.
 
-    extern bool g_txActive;                   // add extern near top
-    const char* liveState = doc["RXTX"] | ""; // field sent by MatriGS
+    extern bool g_txActive;
+    const char* liveState = doc["RXTX"] | ""; // Field sent by MatriGS.
     bool newTxActive = (strcmp(liveState, "TX") == 0);
 
-    /* if we just fell back to RX, flush any queued command ---- */
+    // If we just fell back to RX from TX, flush any queued command.
     extern PendingTxChange g_pendingTx;
     if (g_txActive && !newTxActive && g_pendingTx.valid) {
 
-        /* build /p:remove + /p:add exactly like in handleSerialCommands */
+        // Build /p:remove + /p:add topics exactly like in handleSerialCommands.
         char topicR[128], topicA[128];
         snprintf(topicR, sizeof(topicR),
                  "matrigs/0/sta/%s/b/%s/p:remove/TXANTENNAS",
@@ -239,35 +260,35 @@ void handleCurrentBandJSON(const char* json)
         client.publish(topicA, g_pendingTx.newAnt.c_str());
 
         publishDebugMessage("[TX-Queue] ▶ executed queued TX change");
-        g_pendingTx.valid = false;            // clear queue
+        g_pendingTx.valid = false; // Clear queue.
     }
-    g_txActive = newTxActive;                 // remember current PTT state
+    g_txActive = newTxActive; // Remember current PTT state.
 
     const char* band = doc["BANDS"] | "?";
-    String ants      = listAntennasForBand(band); // sorted antennas
+    String ants      = listAntennasForBand(band); // Get sorted antennas for the band.
 
-    /* update currentRXTX if TARGET present */
+    // Update `currentRXTX` if `TARGET` field is present.
     if (doc.containsKey("TARGET")) {
         const char* rxtx = doc["TARGET"]["RXTX"] | "";
         strncpy(currentRXTX, rxtx, sizeof(currentRXTX) - 1);
     }
 
-    /* dedup: recompute hash of antenna string */
+    // Deduplicate: recompute hash of antenna string.
     uint32_t hash = 5381;
-    for (char c : ants) hash = ((hash << 5) + hash) ^ c;  // djb2-xor
+    for (char c : ants) hash = ((hash << 5) + hash) ^ c; // djb2-xor hash.
 
-    if (lastBand == band && lastHash == hash) return;     // nothing new
+    if (lastBand == band && lastHash == hash) return; // Nothing new, return.
     lastBand = band;
     lastHash = hash;
 
-    /* concise debug line */
+    // Publish concise debug line.
     char dbg[192];
     snprintf(dbg, sizeof(dbg), "[BandChange] %s | antennas: %s",
              band, ants.c_str());
     publishDebugMessage(dbg);
 
-    /* update globals */
+    // Update global state variables.
     currentBand     = band;
     currentAntennas = ants;
-    currentAntList  = getCurrentAntList();   // << tokenise once
+    currentAntList  = getCurrentAntList(); // Tokenize once.
 }
