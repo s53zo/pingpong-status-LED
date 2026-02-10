@@ -18,7 +18,9 @@ This firmware turns an ESP8266 (NodeMCU) into:
 - WiFi + MQTT device with a small config web UI and OTA update page
 - WS2812FX LED status/effects controller (`D3`, 4 LEDs)
 - MatriGS MQTT client that tracks band/antenna state and can switch antennas via MQTT commands
-- USB-serial command interface (single digit `0-9` to select an antenna, plus `debug`/`stop`)
+- Input interfaces:
+  - USB-serial commands: `debug`, `stop`, or a number (`0..15`) to select an antenna
+  - Optional external 4x4 keypad over I2C (MCP23008)
 
 ### Web UI + OTA
 - `GET /` config + status page
@@ -42,3 +44,17 @@ MatriGS integration (station-based):
 - `<mode>,<brightness>,<speed>,<hexcolor>`
 
 See https://github.com/kitesurfer1404/WS2812FX for effect/mode numbers.
+
+### External keypad (optional, MCP23008 over I2C)
+Hardware (NodeMCU):
+- Keypad VCC -> `3V3` (do not use 5V; I2C lines must be 3.3V)
+- Keypad GND -> `GND`
+- Keypad SDA -> `D2` (GPIO4)
+- Keypad SCL -> `D1` (GPIO5)
+- Default I2C address: `0x27` (changeable via address pads on the MCP23008 board)
+
+Keys map to selection indices:
+- `0..9` -> `0..9`
+- `A` -> `10`, `B` -> `11`, `C` -> `12`, `D` -> `13`, `*` -> `14`, `#` -> `15`
+
+When debug is enabled, key presses log: `[Keypad] raw=<0..15> label=<char> idx=<0..15>`.

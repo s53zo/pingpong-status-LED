@@ -9,8 +9,10 @@
 #include <Ticker.h>
 #include <vector> 
 #include <map>
+#include <Wire.h>
 
 #include "antenna_mqtt_handler.h"
+#include "dongutec_keypad_mcp23008.h"
 
 // WiFi + MQTT setup
 WiFiClient espClient;
@@ -24,6 +26,19 @@ ESP8266HTTPUpdateServer httpUpdater;
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
 WS2812FX ws2812fx = WS2812FX(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// -----------------------------------------------------------------
+//  External keypad (Dongutec 4x4 via MCP23008 on I2C)
+//  Default I2C address is 0x27 (can be changed via address pads).
+// -----------------------------------------------------------------
+static constexpr uint8_t  KEYPAD_I2C_ADDR      = 0x27;
+static constexpr uint8_t  KEYPAD_SDA_PIN       = D2;     // GPIO4
+static constexpr uint8_t  KEYPAD_SCL_PIN       = D1;     // GPIO5
+static constexpr uint32_t KEYPAD_POLL_MS       = 20;     // poll cadence
+static constexpr uint32_t KEYPAD_DEBOUNCE_MS   = 50;     // stable time before press event
+
+DongutecKeypadMcp23008 g_keypad(KEYPAD_I2C_ADDR);
+bool g_keypadPresent = false;
 
 // Buffers
 char ssid[32], password[32], mqtt_server[40], station_name[32];
@@ -179,6 +194,10 @@ void handleRoot()
 
   snprintf(line, sizeof(line),
            "<li>Station: <b>%s</b></li>", station_name);
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>Keypad (MCP23008): <b>%s</b></li>", g_keypadPresent ? "present" : "absent");
   server.sendContent(line);
 
   snprintf(line, sizeof(line),
@@ -578,79 +597,60 @@ void reconnectMQTT() {
 }
 
 /* ================================================================
- *  Read one line from USB-Serial and act on it.
- *
- *  • User types a single digit 0-9 + <Enter>.
- *      0  →  hard-wired dummy load  ("LOAD-2KA")
- *      1… →  entry n-1 of currentAntList (band-sorted list)
- *
- *  • If the target bank is RX  →  publish immediately
- *    If the target bank is TX and PTT is active (g_txActive == true)
- *      →  queue the change in g_pendingTx and wait until RTX returns to RX
- *
- *  • Publishes     p:remove/…ANTENNAS   (plain text old antenna)
- *                  p:add/…ANTENNAS      (plain text new antenna)
+ *  Shared actions (Serial and external keypad)
  * ===============================================================*/
-/* ================================================================
- *  handleSerialCommands()
- *  • utility text commands:  debug, stop
- *  • quick-select digit 0-9  →  antenna switch / queue
- * ===============================================================*/
-void handleSerialCommands()
+static void enableDebugFor1Minute(const char* source)
 {
-    /* ── nothing waiting? ────────────────────────────────────── */
-    if (!Serial.available()) return;
+    debugEnabled  = true;
+    debugDeadline = millis() + 60'000;    // auto-off in 1 min
+    Serial.println(F("🟢 Debug enabled for 1 minute"));
 
-    /* ── read one LF-terminated line and trim whitespace ─────── */
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (!cmd.length()) return;                // empty line
+    char msg[128];
+    snprintf(msg, sizeof(msg), "[%s] debug ON (1 min)", source);
+    publishDebugMessage(msg);
+}
 
-    /* ----------------------------------------------------------
-     *  textual utility commands
-     * ---------------------------------------------------------*/
-    if (cmd.equalsIgnoreCase("debug")) {
-        debugEnabled  = true;
-        debugDeadline = millis() + 60'000;    // auto-off in 1 min
-        Serial.println(F("🟢 Debug enabled for 1 minute"));
-        publishDebugMessage("[Serial] debug ON (1 min)");
-        return;
-    }
+static void stopLedEffects(const char* source)
+{
+    ws2812fx.stop();
+    ws2812fx.clear();
+    Serial.println(F("[LED] stopped"));
 
-    if (cmd.equalsIgnoreCase("stop")) {       // stop LED effects
-        ws2812fx.stop();
-        ws2812fx.clear();
-        Serial.println(F("[Serial] LEDs stopped"));
-        publishDebugMessage("[Serial] LEDs stopped via USB");
-        return;
-    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "[%s] LEDs stopped", source);
+    publishDebugMessage(msg);
+}
 
-    /* ----------------------------------------------------------
-     *  quick-select: exactly one decimal digit 0-9
-     * ---------------------------------------------------------*/
-    if (cmd.length() != 1 || !isDigit(cmd[0])) {
-        Serial.println(F("[Serial] ❓ Unrecognised command – try a digit 0-9"));
-        return;
-    }
+// idx:
+// - 0     => LOAD-2KA dummy load
+// - 1..N  => currentAntList[idx-1]
+static void selectAntennaByIndex(int idx, const char* source)
+{
+    if (idx < 0) return;
 
-    int idx = cmd[0] - '0';
-
-    /* map digit to antenna name -------------------------------- */
+    /* map index to antenna name -------------------------------- */
     String chosen;
     if (idx == 0) {
         chosen = F("LOAD-2KA");               // dummy load
     } else if (idx <= (int)currentAntList.size()) {
         chosen = currentAntList[idx - 1];     // 1-based → 0-based
     } else {
-        Serial.printf("[SerialSelect] Invalid antenna number %d\n", idx);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "[%sSelect] Invalid antenna index %d (max %d)",
+                 source, idx, (int)currentAntList.size());
+        Serial.println(msg);
+        publishDebugMessage(msg);
         return;
     }
 
-    Serial.printf("[SerialSelect] %s band=%s → %s\n",
-                  currentRXTX, currentBand.c_str(), chosen.c_str());
+    char msg[192];
+    snprintf(msg, sizeof(msg), "[%sSelect] %s band=%s -> %s",
+             source, currentRXTX, currentBand.c_str(), chosen.c_str());
+    publishDebugMessage(msg);
 
     /* find currently active antenna in this bank --------------- */
-    BandState curState  = g_bandStates[currentBand];
+    BandState curState   = g_bandStates[currentBand];
     String    currentSel = (currentRXTX[0] == 'R') ? curState.rx
                                                    : curState.tx;
 
@@ -660,15 +660,19 @@ void handleSerialCommands()
         g_pendingTx.oldAnt = currentSel;
         g_pendingTx.newAnt = chosen;
         g_pendingTx.valid  = true;
-        publishDebugMessage("[TX-Queue] 💤 queued until RTX returns to RX");
+
+        snprintf(msg, sizeof(msg), "[TX-Queue] queued via %s until RTX returns to RX", source);
+        publishDebugMessage(msg);
         return;
     }
 
     /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
     if (!client.connected()) {
-        publishDebugMessage("[SerialSelect] ⚠ MQTT not connected");
+        snprintf(msg, sizeof(msg), "[%sSelect] MQTT not connected", source);
+        publishDebugMessage(msg);
     } else if (currentSel == chosen) {
-        publishDebugMessage("[SerialSelect] 🔄 already active");
+        snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
+        publishDebugMessage(msg);
     } else {
         /* remove old (if any) */
         if (currentSel.length()) {
@@ -686,11 +690,154 @@ void handleSerialCommands()
         client.publish(topicA, chosen.c_str());
     }
 
-    /* 3️⃣ update cache ----------------------------------------- */
+    /* ----------------------------------------------------------
+     *  3️⃣ update cache -----------------------------------------
+     * ---------------------------------------------------------*/
     if (currentRXTX[0] == 'R')
         g_bandStates[currentBand].rx = chosen;
     else
         g_bandStates[currentBand].tx = chosen;
+}
+
+static bool parseUnsignedInt(const String& s, int* out)
+{
+    if (!out) return false;
+    if (!s.length()) return false;
+
+    int v = 0;
+    for (size_t i = 0; i < s.length(); ++i) {
+        if (!isDigit(s[i])) return false;
+        v = (v * 10) + (s[i] - '0');
+        if (v > 1000) break;  // sanity cap
+    }
+    *out = v;
+    return true;
+}
+
+/* ================================================================
+ *  External keypad support (Dongutec 4x4 via MCP23008)
+ *  Key index 0..15 is translated to a keypad label for mapping.
+ * ===============================================================*/
+static char keypadLabelFromKeyIndex(int8_t keyIndex)
+{
+    // Default mapping for a typical 4x4 keypad:
+    //  [ 1 2 3 A ]
+    //  [ 4 5 6 B ]
+    //  [ 7 8 9 C ]
+    //  [ * 0 # D ]
+    // The MCP23008 example returns keys as col*4 + row (column-major).
+    static const char labels[16] = {
+        '1','4','7','*',
+        '2','5','8','0',
+        '3','6','9','#',
+        'A','B','C','D',
+    };
+    if (keyIndex < 0 || keyIndex > 15) return '?';
+    return labels[(uint8_t)keyIndex];
+}
+
+static int keypadSelectionIndexFromLabel(char label)
+{
+    if (label >= '0' && label <= '9') return label - '0';
+    switch (label) {
+      case 'A': return 10;
+      case 'B': return 11;
+      case 'C': return 12;
+      case 'D': return 13;
+      case '*': return 14;
+      case '#': return 15;
+      default:  return -1;
+    }
+}
+
+static void handleKeypad()
+{
+    if (!g_keypadPresent) return;
+
+    static uint32_t lastPoll = 0;
+    static int8_t   candidateKey = -1;
+    static uint32_t candidateSince = 0;
+    static int8_t   debouncedKey = -1;
+
+    const uint32_t now = millis();
+    if (now - lastPoll < KEYPAD_POLL_MS) return;
+    lastPoll = now;
+
+    const int8_t rawKey = g_keypad.readKeyIndex();
+    if (rawKey < -1) {
+        static uint32_t lastErr = 0;
+        if (debugEnabled && now - lastErr > 2000) {
+            publishDebugMessage("[Keypad] I2C error (check wiring/address)");
+            lastErr = now;
+        }
+        return;
+    }
+
+    if (rawKey != candidateKey) {
+        candidateKey = rawKey;
+        candidateSince = now;
+    }
+
+    if (now - candidateSince < KEYPAD_DEBOUNCE_MS) return;
+    if (debouncedKey == candidateKey) return;  // no state change
+
+    debouncedKey = candidateKey;
+
+    // Only act on press transitions (ignore releases).
+    if (debouncedKey < 0) return;
+
+    const char label = keypadLabelFromKeyIndex(debouncedKey);
+    const int  idx   = keypadSelectionIndexFromLabel(label);
+
+    if (debugEnabled) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "[Keypad] raw=%d label=%c idx=%d", debouncedKey, label, idx);
+        publishDebugMessage(msg);
+    }
+
+    if (idx >= 0) {
+        selectAntennaByIndex(idx, "Keypad");
+    }
+}
+
+/* ================================================================
+ *  Read one line from USB-Serial and act on it.
+ *  • utility text commands:  debug, stop
+ *  • quick-select number (0..N) → antenna switch / queue
+ * ===============================================================*/
+void handleSerialCommands()
+{
+    /* ── nothing waiting? ────────────────────────────────────── */
+    if (!Serial.available()) return;
+
+    /* ── read one LF-terminated line and trim whitespace ─────── */
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (!cmd.length()) return;                // empty line
+
+    /* ----------------------------------------------------------
+     *  textual utility commands
+     * ---------------------------------------------------------*/
+    if (cmd.equalsIgnoreCase("debug")) {
+        enableDebugFor1Minute("Serial");
+        return;
+    }
+
+    if (cmd.equalsIgnoreCase("stop")) {
+        stopLedEffects("Serial");
+        return;
+    }
+
+    /* ----------------------------------------------------------
+     *  quick-select: unsigned integer (eg "0", "1", ... "15")
+     * ---------------------------------------------------------*/
+    int idx = -1;
+    if (!parseUnsignedInt(cmd, &idx)) {
+        Serial.println(F("[Serial] Unrecognised command - try: debug, stop, or a number (0..15)"));
+        return;
+    }
+
+    selectAntennaByIndex(idx, "Serial");
 }
 
 
@@ -703,6 +850,16 @@ void setup() {
   Serial.println(VER);
   debugDeadline += millis();          // absolute timestamp, ~60 s from now
   Serial.println(F("🟢 Debug enabled for 1 minute after boot"));
+
+  // I2C keypad (optional)
+  Wire.begin(KEYPAD_SDA_PIN, KEYPAD_SCL_PIN);
+  Wire.setClock(100000);
+  g_keypadPresent = g_keypad.begin(Wire);
+  if (g_keypadPresent) {
+    publishDebugMessage("[Keypad] MCP23008 detected");
+  } else {
+    publishDebugMessage("[Keypad] MCP23008 not detected (skipping)");
+  }
 
   loadConfigFromEEPROM();
   setupWiFi();
@@ -728,6 +885,7 @@ void setup() {
 
 void loop() {
   handleSerialCommands();   // react to "debug" / "stop" over USB
+  handleKeypad();           // external 4x4 keypad via MCP23008 (optional)
   // --------------------------------------------------------------
   //  Auto-disable debug once the first minute has passed
   // --------------------------------------------------------------
