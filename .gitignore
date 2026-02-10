@@ -1,0 +1,7 @@
+.DS_Store
+
+# Arduino/ESP build outputs
+build/
+*.bin
+*.elf
+*.map
