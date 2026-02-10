@@ -1,47 +1,44 @@
 Circuit board:
 https://oshwlab.com/s53zo/pingpong-lucke
 
-Short description:
-This code configures an ESP8266 microcontroller to connect to WiFi, host a web interface for setup, control WS2812 LEDs, and communicate with an MQTT server for remote commands. It allows users to easily configure network settings, update firmware over the air, and manage LED lighting effects remotely through MQTT, making it ideal for smart home applications and IoT projects. The device automatically handles reconnections and offers power-saving features by turning off LEDs when not in use.
+## Sketches in this repo
 
-Longer description:
-This code transforms an ESP8266 microcontroller, I use NodeMCU 0.9, into a smart WiFi and LED controller with MQTT integration. Here's what it does:
+Current firmware (root):
+- `pingpong.FX_LEDs.ino` (main code)
+- `antenna_mqtt_handler.cpp` / `antenna_mqtt_handler.h`
 
-1. **WiFi Configuration and Setup:**
-   - When you first power on the device, it either connects to your existing WiFi network or sets up its own WiFi network (called "ESP8266_Setup") if it can't connect.
-   - You can connect to this network from your phone or computer and access a setup page at the default IP address.
+Legacy firmware:
+- `legacy/pingpong.FX_LEDs.ino` (older LED-only MQTT controller)
 
-2. **Web Interface for Configuration:**
-   - The device hosts a simple web page where you can enter your WiFi network name (SSID), password, and MQTT server details (IP address and port).
-   - Once you submit this information, the device saves it and restarts to connect to your specified network and MQTT server.
+Note for Arduino tooling:
+- `pingpong-status-LED.ino` is an empty entrypoint so the sketch filename matches the folder name (required by `arduino-cli`).
 
-3. **LED Control through MQTT:**
-   - The ESP8266 controls a strip of WS2812 LEDs, allowing you to change the colors, brightness, and patterns through MQTT messages.
-   - You can send specific commands like turning the LEDs on and off, changing colors, or setting them to blink in different patterns via an MQTT topic.
+## Current firmware summary (root)
+This firmware turns an ESP8266 (NodeMCU) into:
+- WiFi + MQTT device with a small config web UI and OTA update page
+- WS2812FX LED status/effects controller (`D3`, 4 LEDs)
+- MatriGS MQTT client that tracks band/antenna state and can switch antennas via MQTT commands
+- USB-serial command interface (single digit `0-9` to select an antenna, plus `debug`/`stop`)
 
-4. **Over-the-Air (OTA) Firmware Updates:**
-   - The device supports OTA updates, meaning you can upload new firmware directly through the web interface without needing a physical connection.
+### Web UI + OTA
+- `GET /` config + status page
+- `POST /save` saves WiFi/MQTT/station config to EEPROM and reboots
+- `GET /update` OTA upload form (`ESP8266HTTPUpdateServer` handles the POST)
 
-5. **Automatic LED Turn-Off:**
-   - If you don't send any LED commands for 60 minutes, the device will automatically turn off the LEDs to save power.
+### MQTT topics (current firmware)
+MAC-based LED control:
+- Subscribe: `pingpong/<MAC>/fxcmd`
+- Publish: `pingpong/<MAC>/fxresp`
+- Publish: `pingpong/<MAC>/debug`
 
-6. **Feedback and Status:**
-   - The device provides feedback over MQTT and through the web interface, so you always know if your commands are received and executed.
-   - It also periodically sends "Alive" messages to let you know it’s still connected and functioning.
+MatriGS integration (station-based):
+- Subscribe: `matrigs/0/sta/<station>/available`
+- Subscribe: `matrigs/0/dt/RTX/d/<station>`
+- Subscribe: `matrigs/0/sta/<station>/b/#`
 
-7. **Built-in Reconnect and Recovery:**
-   - If the device loses its connection to the WiFi or MQTT server, it automatically tries to reconnect. If it can't connect to WiFi, it goes back into setup mode, making it easy to reconfigure.
+### LED commands (publish to `pingpong/<MAC>/fxcmd`)
+- `stop`
+- `segment,<pixel>,<mode>,<brightness>,<speed>,<RRGGBB>`
+- `<mode>,<brightness>,<speed>,<hexcolor>`
 
-Overall, this code makes the ESP8266 a flexible and user-friendly tool for smart home projects, particularly those involving LED lighting and remote control through WiFi and MQTT.
-
-MQTT messages can be sent to control the LEDs with the following format:
-
-Static mode: 0,255,100,FF0000 - Mode 0, full brightness, speed 100, red color.
-
-Blink mode: 1,128,200,00FF00 - Mode 1, half brightness, speed 200, green color.
-
-Turn off LEDs: stop
-
-Segment control: segment,0,2,255,100,FF0000 - LED 0, mode 2, full brightness, speed 100, red color.
-
-See https://github.com/kitesurfer1404/WS2812FX GitHub page for more payload examples.
+See https://github.com/kitesurfer1404/WS2812FX for effect/mode numbers.
