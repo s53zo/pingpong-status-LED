@@ -1,15 +1,17 @@
 # Repository Guidelines
 
+**IMPORTANT:** Power the MCP23008 keypad board from the **3.3V** pin. Do **not** use 5V.
+
 ## Project Structure & Module Organization
 
 - `pingpong.FX_LEDs.ino`: primary ESP8266 firmware (WiFi config UI, MQTT, WS2812FX, MatriGS integration, input handling).
-- `pingpong-status-LED.ino`: empty sketch entrypoint so Arduino tooling accepts this folder as a sketch.
+- `pingpong-status-LED.ino`: empty entrypoint so Arduino tooling accepts this sketch.
 - `antenna_mqtt_handler.cpp` / `antenna_mqtt_handler.h`: MatriGS JSON helpers, antenna sorting/caches, TX-queue logic.
 - `dongutec_keypad_mcp23008.cpp` / `dongutec_keypad_mcp23008.h`: optional external 4x4 keypad over I2C via MCP23008.
 - `legacy/pingpong.FX_LEDs.ino`: older LED-only firmware kept for reference.
 - `pingpong*.jpg`, `Pingpong skatla.stl`: documentation/assets.
 
-There are no automated tests in this repo; validation is compile + on-device smoke testing.
+No automated tests; validate by compile + on-device smoke testing.
 
 ## Build, Test, and Development Commands
 
@@ -22,7 +24,7 @@ There are no automated tests in this repo; validation is compile + on-device smo
 
 ## Coding Style & Naming Conventions
 
-- Follow existing Arduino/C++ style in the file you are editing; prefer 2-space indentation and no tabs.
+- Follow existing style; prefer 2-space indentation (no tabs).
 - Names:
   - Functions: `lowerCamelCase` (e.g., `handleSerialCommands`).
   - Shared globals/state: `g_*` (e.g., `g_txActive`, `g_pendingTx`).
