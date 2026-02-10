@@ -99,6 +99,9 @@ char topic_cmd[128];
 char topic_available[128];
 char topic_dt[128];
 
+// Forward declarations (used in MQTT callback)
+static void enableDebugFor1Minute(const char* source);
+
 // -----------------------------------------------------------------
 //  Debug helper – only speaks when debugEnabled == true
 // -----------------------------------------------------------------
@@ -107,6 +110,14 @@ void publishDebugMessage(const char* msg) {
 
   Serial.println(msg);
 
+  if (clientCmd.connected() && debug_topic[0])
+    clientCmd.publish(debug_topic, msg);
+}
+
+// Publish even when debugEnabled is off (use sparingly for user-triggered events).
+static void publishDebugMessageAlways(const char* msg)
+{
+  Serial.println(msg);
   if (clientCmd.connected() && debug_topic[0])
     clientCmd.publish(debug_topic, msg);
 }
@@ -249,6 +260,17 @@ void handleRoot()
 
   snprintf(line, sizeof(line),
            "<li>Debug topic: <code>%s</code></li>", debug_topic);
+  server.sendContent(line);
+
+  if (debugEnabled) {
+    long msLeft = (debugDeadline > 0) ? (long)(debugDeadline - millis()) : 0;
+    if (msLeft < 0) msLeft = 0;
+    snprintf(line, sizeof(line),
+             "<li>Debug: <b>ON</b> (%lds remaining)</li>", msLeft / 1000);
+  } else {
+    snprintf(line, sizeof(line),
+             "<li>Debug: <b>OFF</b> (send MQTT <code>debug</code> to fxcmd)</li>");
+  }
   server.sendContent(line);
 
   /* --- LED cheat-sheet --- */
@@ -577,6 +599,14 @@ void callback(char* topic, byte* payload, unsigned int length)
      * -------------------------------------------------------------*/
     else if (strcmp(topicCopy, command_topic) == 0) {
 
+      // Utility command to (re-)enable debug without a serial cable.
+      // Publish "debug" to pingpong/<MAC>/fxcmd.
+      if (strcmp(msg, "debug") == 0 || strcmp(msg, "DEBUG") == 0) {
+          enableDebugFor1Minute("MQTT");
+          handled = true;
+          return;
+      }
+
       if (debugEnabled) {                    // ① don’t always print/publish
           publishDebugMessage("[FX] cmd RX");
       }
@@ -712,6 +742,10 @@ static void selectAntennaByIndex(int idx, const char* source)
 {
     if (idx < 0) return;
 
+    void (*pub)(const char*) = publishDebugMessage;
+    if (source && strcmp(source, "Keypad") == 0)
+        pub = publishDebugMessageAlways;
+
     refreshAntennaListForCurrentBandIfNeeded();
 
     /* map index to antenna name -------------------------------- */
@@ -725,15 +759,14 @@ static void selectAntennaByIndex(int idx, const char* source)
         snprintf(msg, sizeof(msg),
                  "[%sSelect] Invalid antenna index %d (max %d) band=%s",
                  source, idx, (int)currentAntList.size(), currentBand.c_str());
-        Serial.println(msg);
-        publishDebugMessage(msg);
+        pub(msg);
         return;
     }
 
     char msg[192];
     snprintf(msg, sizeof(msg), "[%sSelect] %s band=%s -> %s",
              source, currentRXTX, currentBand.c_str(), chosen.c_str());
-    publishDebugMessage(msg);
+    pub(msg);
 
     /* find currently active antenna in this bank --------------- */
     BandState curState   = g_bandStates[currentBand];
@@ -748,17 +781,17 @@ static void selectAntennaByIndex(int idx, const char* source)
         g_pendingTx.valid  = true;
 
         snprintf(msg, sizeof(msg), "[TX-Queue] queued via %s until RTX returns to RX", source);
-        publishDebugMessage(msg);
+        pub(msg);
         return;
     }
 
     /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
     if (!clientMatrigs.connected()) {
         snprintf(msg, sizeof(msg), "[%sSelect] MatriGS MQTT not connected", source);
-        publishDebugMessage(msg);
+        pub(msg);
     } else if (currentSel == chosen) {
         snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
-        publishDebugMessage(msg);
+        pub(msg);
     } else {
         /* remove old (if any) */
         if (currentSel.length()) {
@@ -875,10 +908,11 @@ static void handleKeypad()
     const char label = keypadLabelFromKeyIndex(debouncedKey);
     const int  idx   = keypadSelectionIndexFromLabel(label);
 
-    if (debugEnabled) {
+    {
+        // Key presses are user-triggered, so always publish even if debug timed out.
         char msg[96];
         snprintf(msg, sizeof(msg), "[Keypad] raw=%d label=%c idx=%d", debouncedKey, label, idx);
-        publishDebugMessage(msg);
+        publishDebugMessageAlways(msg);
     }
 
     if (idx >= 0) {
