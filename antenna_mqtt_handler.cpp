@@ -167,6 +167,18 @@ void handleBandStateJSON(const char* band, const char* json)       // NEW
     /* keep the public “currentBand” in sync so the UI stays sane */
     extern String currentBand;
     currentBand = band;
+
+    // Also keep the antenna list in sync for the UI and keypad selection.
+    // This is important when the legacy DT feed reports BANDS="-" (OFFLINE),
+    // because then `handleCurrentBandJSON()` won't refresh `currentAntennas`.
+    String ants = listAntennasForBand(band);
+    if (ants.length()) {
+        currentAntennas = ants;
+        currentAntList  = getCurrentAntList();
+    } else {
+        currentAntennas = "?";
+        currentAntList.clear();
+    }
 }
 
 /* ================================================================
@@ -180,6 +192,16 @@ void handleAvailableJSON(const char* json)
     if (deserializeJson(availableDoc, json)) {
         publishDebugMessage("[handleAvailableJSON] ❌ JSON parse error");
         return;
+    }
+
+    // If we already know the current band (eg from retained per-band JSON),
+    // refresh the current antenna list so the web UI stays useful.
+    if (currentBand.length() && currentBand != "?" && currentBand != "-") {
+        String ants = listAntennasForBand(currentBand.c_str());
+        if (ants.length()) {
+            currentAntennas = ants;
+            currentAntList  = getCurrentAntList();
+        }
     }
 
     /* pretty print for Serial monitor (optional) */
