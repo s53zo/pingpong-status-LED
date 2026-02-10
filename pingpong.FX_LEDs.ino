@@ -39,6 +39,7 @@ static constexpr uint32_t KEYPAD_DEBOUNCE_MS   = 50;     // stable time before p
 
 DongutecKeypadMcp23008 g_keypad(KEYPAD_I2C_ADDR);
 bool g_keypadPresent = false;
+uint8_t g_keypadI2cAddr = 0;  // 0 => unknown/absent
 
 // Buffers
 char ssid[32], password[32], mqtt_server[40], station_name[32];
@@ -196,8 +197,14 @@ void handleRoot()
            "<li>Station: <b>%s</b></li>", station_name);
   server.sendContent(line);
 
-  snprintf(line, sizeof(line),
-           "<li>Keypad (MCP23008): <b>%s</b></li>", g_keypadPresent ? "present" : "absent");
+  if (g_keypadPresent) {
+    snprintf(line, sizeof(line),
+             "<li>Keypad (MCP23008): <b>present</b> (0x%02X)</li>",
+             g_keypadI2cAddr);
+  } else {
+    snprintf(line, sizeof(line),
+             "<li>Keypad (MCP23008): <b>absent</b></li>");
+  }
   server.sendContent(line);
 
   snprintf(line, sizeof(line),
@@ -582,6 +589,19 @@ void reconnectMQTT() {
       client.subscribe(topic_cmd);
       client.subscribe(topic1);
       client.subscribe(topic2);
+      client.subscribe(topic_band_wildcard);   // per-band RX/TX state (needed for g_bandStates)
+
+      // Keypad status is useful even when debug is disabled, so publish it
+      // directly to the debug topic after MQTT connects.
+      if (debug_topic[0]) {
+        char kmsg[96];
+        if (g_keypadPresent) {
+          snprintf(kmsg, sizeof(kmsg), "[Keypad] present @0x%02X (SDA=D2 SCL=D1 3.3V)", g_keypadI2cAddr);
+        } else {
+          snprintf(kmsg, sizeof(kmsg), "[Keypad] absent (expected 0x20..0x27, power=3.3V)");
+        }
+        client.publish(debug_topic, kmsg);
+      }
 
       snprintf(logBuffer, sizeof(logBuffer), "Subscribed to command topic: %s", topic_cmd);
       publishDebugMessage(logBuffer);
@@ -854,11 +874,30 @@ void setup() {
   // I2C keypad (optional)
   Wire.begin(KEYPAD_SDA_PIN, KEYPAD_SCL_PIN);
   Wire.setClock(100000);
-  g_keypadPresent = g_keypad.begin(Wire);
+  g_keypadPresent = false;
+  g_keypadI2cAddr = 0;
+
+  // Probe the full MCP23008 address range (0x20..0x27) so we don't
+  // depend on how the address pads are configured on the board.
+  for (uint8_t addr = 0x20; addr <= 0x27; ++addr) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      g_keypadI2cAddr = addr;
+      break;
+    }
+  }
+
+  if (g_keypadI2cAddr) {
+    g_keypad = DongutecKeypadMcp23008(g_keypadI2cAddr);
+    g_keypadPresent = g_keypad.begin(Wire);
+  }
+
   if (g_keypadPresent) {
-    publishDebugMessage("[Keypad] MCP23008 detected");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "[Keypad] MCP23008 detected @0x%02X", g_keypadI2cAddr);
+    publishDebugMessage(msg);
   } else {
-    publishDebugMessage("[Keypad] MCP23008 not detected (skipping)");
+    publishDebugMessage("[Keypad] MCP23008 not detected (0x20..0x27)");
   }
 
   loadConfigFromEEPROM();
