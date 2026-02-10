@@ -4,55 +4,47 @@
 
 ## Project Structure & Module Organization
 
-- `pingpong.FX_LEDs.ino`: primary ESP8266 firmware (WiFi config UI, MQTT, WS2812FX, MatriGS integration, input handling).
-- `pingpong-status-LED.ino`: empty entrypoint so Arduino tooling accepts this sketch.
-- `antenna_mqtt_handler.cpp` / `antenna_mqtt_handler.h`: MatriGS JSON helpers, antenna sorting/caches, TX-queue logic.
-- `dongutec_keypad_mcp23008.cpp` / `dongutec_keypad_mcp23008.h`: optional external 4x4 keypad over I2C via MCP23008.
-- `legacy/pingpong.FX_LEDs.ino`: older LED-only firmware kept for reference.
-- `pingpong*.jpg`, `Pingpong skatla.stl`: documentation/assets.
-
-No automated tests; validate by compile + on-device smoke testing.
+- `pingpong.FX_LEDs.ino`: main ESP8266 firmware (web config UI, WS2812FX, keypad, MatriGS integration).
+- `pingpong-status-LED.ino`: thin sketch entrypoint for Arduino tooling.
+- `antenna_mqtt_handler.*`: MatriGS JSON parsing, antenna sorting/caching, TX-queue logic.
+- `dongutec_keypad_mcp23008.*`: Dongutec 4x4 keypad driver (MCP23008 over I2C).
+- `legacy/`: older firmware snapshots kept for reference.
 
 ## Build, Test, and Development Commands
 
-- Build (NodeMCU):
-  - `arduino-cli compile --fqbn esp8266:esp8266:nodemcu .`
-- Upload (example, set your port):
-  - `arduino-cli upload --fqbn esp8266:esp8266:nodemcu --port /dev/tty.usbserial-XXXX .`
-- Helpful:
-  - `arduino-cli lib list` (confirm `WS2812FX`, `PubSubClient`, `ArduinoJson` installed)
+- Build: `arduino-cli compile --fqbn esp8266:esp8266:nodemcu .`
+- Build to folder: `arduino-cli compile --fqbn esp8266:esp8266:nodemcu --output-dir build/out .`
+- OTA upload: `curl -F "update=@build/out/pingpong-status-LED.ino.bin" http://<device-ip>/update`
+- Serial upload: `arduino-cli upload --fqbn esp8266:esp8266:nodemcu --port /dev/tty.usbserial-XXXX .`
+- Debug tail (Pingpong broker): `mosquitto_sub -h <broker> -p 1883 -t 'pingpong/<MAC>/debug' -v`
+- MatriGS tail (MatriGS broker): `mosquitto_sub -h <broker> -p 4883 -t 'matrigs/0/sta/<STA>/#' -v`
+
+## Architecture Overview
+
+- Two MQTT connections are used:
+  - `clientCmd` (Pingpong broker): LED commands `pingpong/<MAC>/fxcmd` and debug `pingpong/<MAC>/debug`.
+  - `clientMatrigs` (MatriGS broker): `matrigs/0/sta/<STA>/available`, legacy DT feed, per-band state, and antenna switch publishes (`p:add/*ANTENNAS`, `p:remove/*ANTENNAS`).
 
 ## Coding Style & Naming Conventions
 
-- Follow existing style; prefer 2-space indentation (no tabs).
-- Names:
-  - Functions: `lowerCamelCase` (e.g., `handleSerialCommands`).
-  - Shared globals/state: `g_*` (e.g., `g_txActive`, `g_pendingTx`).
-  - MQTT topics/buffers: `topic_*` / `*_topic` and fixed-size `char[]` buffers.
-- Keep memory in mind (ESP8266): avoid large temporary `String` concatenations inside tight loops.
-- Keypad orientation differs between builds; adjust the `labels[16]` mapping in `pingpong.FX_LEDs.ino` if key labels don’t match your physical keypad.
+- Prefer 2-space indentation and fixed-size `char[]` topic buffers (ESP8266 RAM is tight).
+- Globals use `g_*`; topics use `topic_*` / `*_topic`.
+- When publishing/subscribing, pick the correct broker (`clientCmd` vs `clientMatrigs`) explicitly.
 
 ## Testing Guidelines
 
-Minimum checklist for changes:
-- `arduino-cli compile ...` succeeds for `esp8266:esp8266:nodemcu`.
-- Device smoke test:
-  - `GET /` loads and shows MAC/station info.
-  - `GET /update` renders OTA form.
-  - MQTT: verify `pingpong/<MAC>/fxcmd` commands and expected subscriptions/publishes.
-  - Keypad (if connected): status shows `Keypad (MCP23008): present`, and pressing keys triggers the same actions as serial number input.
+- Always run a compile for `esp8266:esp8266:nodemcu`.
+- After flashing, verify `GET /` and `GET /update` load.
+- Keypad wiring: `SDA=D2`, `SCL=D1`, power **3.3V**, I2C address auto-detects `0x20..0x27`.
+- Debug auto-disables after 60s; publish `debug` to `pingpong/<MAC>/fxcmd` to re-enable for 1 minute.
 
 ## Commit & Pull Request Guidelines
 
-- Commit messages in history are short and imperative (e.g., `Update README.md`). Keep that style; add a scope when helpful (e.g., `firmware: fix MQTT resubscribe`).
-- PRs should include:
-  - Target board + wiring assumptions (LED pin `D3`, `NUM_LEDS`).
-  - If keypad-related: I2C pins (`SDA=D2`, `SCL=D1`), 3.3V power, and I2C address (default `0x27`).
-  - Any MQTT topic/payload changes.
-  - Note if EEPROM layout or `/update` behavior changes.
-  - Compile confirmation output (or the exact command used).
+- Keep commit messages short and imperative; add a scope prefix when helpful (`MQTT:`, `Keypad:`, `UI:`).
+- PRs must include: target board, wiring/pins, both broker endpoints/ports, and how you validated (commands + observed MQTT lines).
 
 ## Security & Configuration Tips
 
-- WiFi/MQTT settings are entered via the web UI and stored in EEPROM; avoid committing real credentials.
-- OTA (`/update`) is intentionally unauthenticated in this firmware: don’t expose the device on untrusted networks.
+- The web UI stores WiFi/MQTT settings in EEPROM; don’t commit real credentials.
+- OTA `/update` is unauthenticated by design; don’t expose devices on untrusted networks.
+
