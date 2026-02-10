@@ -641,12 +641,29 @@ static void stopLedEffects(const char* source)
     publishDebugMessage(msg);
 }
 
+static void refreshAntennaListForCurrentBandIfNeeded()
+{
+    // When MatriGS doesn't provide a "current band" (eg OFFLINE),
+    // `currentAntList` may be empty even though `/available` has data.
+    // Refresh lazily from the availability cache based on `currentBand`.
+    static String lastBand = "";
+    if (!currentBand.length()) return;
+    if (currentBand == "?" || currentBand == "-") return;
+    if (currentBand == lastBand && !currentAntList.empty()) return;
+
+    currentAntennas = listAntennasForBand(currentBand.c_str());
+    currentAntList  = getCurrentAntList();
+    lastBand        = currentBand;
+}
+
 // idx:
 // - 0     => LOAD-2KA dummy load
 // - 1..N  => currentAntList[idx-1]
 static void selectAntennaByIndex(int idx, const char* source)
 {
     if (idx < 0) return;
+
+    refreshAntennaListForCurrentBandIfNeeded();
 
     /* map index to antenna name -------------------------------- */
     String chosen;
@@ -657,8 +674,8 @@ static void selectAntennaByIndex(int idx, const char* source)
     } else {
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "[%sSelect] Invalid antenna index %d (max %d)",
-                 source, idx, (int)currentAntList.size());
+                 "[%sSelect] Invalid antenna index %d (max %d) band=%s",
+                 source, idx, (int)currentAntList.size(), currentBand.c_str());
         Serial.println(msg);
         publishDebugMessage(msg);
         return;

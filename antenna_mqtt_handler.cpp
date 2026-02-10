@@ -213,6 +213,7 @@ void handleCurrentBandJSON(const char* json)
 {
     static String   lastBand = "?";
     static uint32_t lastHash = 0;   // djb2-xor of antenna list
+    static bool     warnedNoBand = false;
 
     /* parse the tiny status JSON */
     DynamicJsonDocument doc(1024);
@@ -244,6 +245,19 @@ void handleCurrentBandJSON(const char* json)
     g_txActive = newTxActive;                 // remember current PTT state
 
     const char* band = doc["BANDS"] | "?";
+
+    // When MatriGS reports OFFLINE it may send BANDS="-" (no current band).
+    // Keep the last valid `currentBand` (often set via retained per-band state)
+    // so keypad selection and UI remain usable.
+    if (!band || !band[0] || strcmp(band, "?") == 0 || strcmp(band, "-") == 0) {
+        if (!warnedNoBand) {
+            publishDebugMessage("[BandChange] BANDS not set (\"-\") - keeping last known band");
+            warnedNoBand = true;
+        }
+        return;
+    }
+    warnedNoBand = false;
+
     String ants      = listAntennasForBand(band); // sorted antennas
 
     /* update currentRXTX if TARGET present */
