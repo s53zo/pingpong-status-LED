@@ -14,9 +14,13 @@
 #include "antenna_mqtt_handler.h"
 #include "dongutec_keypad_mcp23008.h"
 
-// WiFi + MQTT setup
-WiFiClient espClient;
-PubSubClient client(espClient);
+// WiFi + MQTT setup (two brokers):
+// - Pingpong broker: LED commands + debug topic
+// - MatriGS broker: station/band state + antenna switching
+WiFiClient espClientCmd;
+WiFiClient espClientMatrigs;
+PubSubClient clientCmd(espClientCmd);
+PubSubClient clientMatrigs(espClientMatrigs);
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
@@ -41,9 +45,23 @@ DongutecKeypadMcp23008 g_keypad(KEYPAD_I2C_ADDR);
 bool g_keypadPresent = false;
 uint8_t g_keypadI2cAddr = 0;  // 0 => unknown/absent
 
+// EEPROM layout (512 bytes reserved)
+static constexpr int EEPROM_SIZE = 512;
+static constexpr int EEPROM_OFF_SSID          = 0;    // char[32]
+static constexpr int EEPROM_OFF_PASSWORD      = 32;   // char[32]
+static constexpr int EEPROM_OFF_MQTT_SERVER   = 64;   // char[40] (Pingpong broker)
+static constexpr int EEPROM_OFF_MQTT_PORT     = 104;  // int
+static constexpr int EEPROM_OFF_STATION       = 108;  // char[32]
+static constexpr int EEPROM_OFF_MATRIGS_SERVER = 140; // char[40]
+static constexpr int EEPROM_OFF_MATRIGS_PORT   = 180; // int
+static constexpr int EEPROM_OFF_MAGIC          = 200; // uint32_t
+static constexpr uint32_t EEPROM_MAGIC_V2      = 0x50494E47; // "PING" marker
+
 // Buffers
 char ssid[32], password[32], mqtt_server[40], station_name[32];
-int mqtt_port = 1883;
+int mqtt_port = 1883;  // Pingpong broker port
+char matrigs_server[40] = "";
+int  matrigs_port = 4883;  // MatriGS default (can be overridden in web UI)
 char logBuffer[256];
 
 char macAddress[18]     = "";          
@@ -89,12 +107,8 @@ void publishDebugMessage(const char* msg) {
 
   Serial.println(msg);
 
-  if (client.connected()) {
-    char debugTopic[100];
-    snprintf(debugTopic, sizeof(debugTopic),
-             "pingpong/%s/debug", WiFi.macAddress().c_str());
-    client.publish(debugTopic, msg);
-  }
+  if (clientCmd.connected() && debug_topic[0])
+    clientCmd.publish(debug_topic, msg);
 }
 
 // --- Web config ---
@@ -169,16 +183,18 @@ void handleRoot()
   send_P(PAGE_HEAD);
 
   /* --- full <form> in one go (needs ~350 B worst-case) --- */
-  char form[512];   // plenty of head-room
+  char form[768];   // plenty of head-room
   snprintf(form, sizeof(form),
            "<form action='/save' method='post'>"
            "SSID:<br><input name='ssid' type='text' value='%s'><br>"
            "Password:<br><input name='password' type='text' value='%s'><br>"
-           "MQTT Server IP:<br><input name='mqtt_server' type='text' value='%s'><br>"
-           "MQTT Port:<br><input name='mqtt_port' type='number' value='%d'><br>"
+           "Pingpong MQTT Server IP:<br><input name='mqtt_server' type='text' value='%s'><br>"
+           "Pingpong MQTT Port:<br><input name='mqtt_port' type='number' value='%d'><br>"
+           "MatriGS MQTT Server IP:<br><input name='matrigs_server' type='text' value='%s'><br>"
+           "MatriGS MQTT Port:<br><input name='matrigs_port' type='number' value='%d'><br>"
            "Station Name (RTX-XX):<br><input name='station_name' type='text' value='%s'><br>"
            "<input type='submit' value='Save & Reboot'></form>",
-           ssid, password, mqtt_server, mqtt_port, station_name);
+           ssid, password, mqtt_server, mqtt_port, matrigs_server, matrigs_port, station_name);
   server.sendContent(form);
 
   /* --- status list --- */
@@ -195,6 +211,14 @@ void handleRoot()
 
   snprintf(line, sizeof(line),
            "<li>Station: <b>%s</b></li>", station_name);
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>Pingpong MQTT: <code>%s:%d</code></li>", mqtt_server, mqtt_port);
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>MatriGS MQTT: <code>%s:%d</code></li>", matrigs_server, matrigs_port);
   server.sendContent(line);
 
   if (g_keypadPresent) {
@@ -258,14 +282,20 @@ void handleSave() {
   strncpy(password, server.arg("password").c_str(), sizeof(password));
   strncpy(mqtt_server, server.arg("mqtt_server").c_str(), sizeof(mqtt_server));
   mqtt_port = server.arg("mqtt_port").toInt();
+  strncpy(matrigs_server, server.arg("matrigs_server").c_str(), sizeof(matrigs_server));
+  matrigs_port = server.arg("matrigs_port").toInt();
   strncpy(station_name, server.arg("station_name").c_str(), sizeof(station_name));
 
-  EEPROM.begin(512);
-  EEPROM.put(0, ssid);
-  EEPROM.put(32, password);
-  EEPROM.put(64, mqtt_server);
-  EEPROM.put(104, mqtt_port);
-  EEPROM.put(108, station_name);
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(EEPROM_OFF_SSID, ssid);
+  EEPROM.put(EEPROM_OFF_PASSWORD, password);
+  EEPROM.put(EEPROM_OFF_MQTT_SERVER, mqtt_server);
+  EEPROM.put(EEPROM_OFF_MQTT_PORT, mqtt_port);
+  EEPROM.put(EEPROM_OFF_STATION, station_name);
+
+  EEPROM.put(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
+  EEPROM.put(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
+  EEPROM.put(EEPROM_OFF_MAGIC, EEPROM_MAGIC_V2);
   EEPROM.commit();
   EEPROM.end();
 
@@ -276,7 +306,8 @@ void handleSave() {
 
 // --- WiFi Setup ---
 /* ================================================================
- *  Bring up Wi-Fi, then build all MQTT topics & subscribe
+ *  Bring up Wi-Fi, then build all MQTT topics.
+ *  (Subscriptions happen after broker connect.)
  * ===============================================================*/
 void setupWiFi()
 {
@@ -346,13 +377,9 @@ void setupWiFi()
     snprintf(topic_band_wildcard, sizeof(topic_band_wildcard),
              "%s#", topic_band_prefix);
 
-    /* ---------- subscribe ----------------------------------------- */
-    client.subscribe(command_topic);              // if broker echoes cmds
-    client.subscribe(topic_available);            // antenna catalogue
-    client.subscribe(topic_dt);                   // legacy combined status
-    client.subscribe(topic_band_wildcard);        // live per-band JSON
-
     /* ---------- console summary ----------------------------------- */
+    Serial.printf("Pingpong broker: %s:%d\n", mqtt_server, mqtt_port);
+    Serial.printf("MatriGS broker:  %s:%d\n", matrigs_server, matrigs_port);
     Serial.print("Command topic: ");  Serial.println(command_topic);
     Serial.print("Feedback topic: "); Serial.println(feedback_topic);
     Serial.print("Debug topic: ");    Serial.println(debug_topic);
@@ -378,24 +405,43 @@ void setupAP() {
 
 // --- Load from EEPROM ---
 void loadConfigFromEEPROM() {
-  EEPROM.begin(512);
-  EEPROM.get(0, ssid);
-  EEPROM.get(32, password);
-  EEPROM.get(64, mqtt_server);
-  EEPROM.get(104, mqtt_port);
-  EEPROM.get(108, station_name);
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(EEPROM_OFF_SSID, ssid);
+  EEPROM.get(EEPROM_OFF_PASSWORD, password);
+  EEPROM.get(EEPROM_OFF_MQTT_SERVER, mqtt_server);
+  EEPROM.get(EEPROM_OFF_MQTT_PORT, mqtt_port);
+  EEPROM.get(EEPROM_OFF_STATION, station_name);
 
   ssid[sizeof(ssid)-1]         = '\0';
   password[sizeof(password)-1] = '\0';
   mqtt_server[sizeof(mqtt_server)-1] = '\0';
   station_name[sizeof(station_name)-1] = '\0';
 
+  // v2+ config fields (separate MatriGS broker) are guarded by a magic marker.
+  uint32_t magic = 0;
+  EEPROM.get(EEPROM_OFF_MAGIC, magic);
+  if (magic == EEPROM_MAGIC_V2) {
+    EEPROM.get(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
+    EEPROM.get(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
+    matrigs_server[sizeof(matrigs_server) - 1] = '\0';
+  } else {
+    // Backward compat: old configs only had one broker.
+    strncpy(matrigs_server, mqtt_server, sizeof(matrigs_server));
+    matrigs_port = 4883;  // MatriGS default port in most installs
+  }
+
+  // Sanity defaults
+  if (!matrigs_server[0] || (uint8_t)matrigs_server[0] == 0xFF)
+    strncpy(matrigs_server, mqtt_server, sizeof(matrigs_server));
+  if (matrigs_port <= 0 || matrigs_port > 65535)
+    matrigs_port = 4883;
+
   EEPROM.end();
 
   Serial.println("Reading configuration from EEPROM");
   Serial.printf("Read SSID: %s\n", ssid);
-  Serial.printf("Read MQTT Server: %s\n", mqtt_server);
-  Serial.printf("Read MQTT Port: %d\n", mqtt_port);
+  Serial.printf("Read Pingpong MQTT: %s:%d\n", mqtt_server, mqtt_port);
+  Serial.printf("Read MatriGS MQTT:  %s:%d\n", matrigs_server, matrigs_port);
   Serial.printf("Read Station Name: %s\n", station_name);
 }
 
@@ -560,60 +606,63 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 }
 
-// --- MQTT reconnect ---
-void reconnectMQTT() {
-  if (!client.connected()) {
-    Serial.println("Attempting MQTT connection...");
-    char clientId[64];
-    snprintf(clientId, sizeof(clientId), "PingPong-%s", WiFi.macAddress().c_str());
+// --- MQTT reconnect (Pingpong broker: LED commands + debug) ---
+static void reconnectMqttCmd()
+{
+  if (clientCmd.connected()) return;
 
-    if (client.connect(clientId)) {
-      publishDebugMessage("MQTT connected successfully.");
+  Serial.println("Attempting MQTT Pingpong connection...");
+  char clientId[64];
+  snprintf(clientId, sizeof(clientId), "PingPong-CMD-%s", macAddress);
 
-      /* ---------- 5-second rainbow hello ------------------------- */
-      ws2812fx.setMode(11);                // FX_MODE_RAINBOW_CYCLE
-      ws2812fx.setBrightness(108);
-      ws2812fx.setSpeed(200);
-      ws2812fx.setColor(0xFF0000);         // colour arg unused by mode 11
-      ws2812fx.start();
+  if (!clientCmd.connect(clientId)) return;
 
-      mqttHelloRunning = true;
-      mqttHelloStart   = millis();
+  publishDebugMessage("[MQTT] Pingpong connected");
 
+  /* ---------- 5-second rainbow hello ------------------------- */
+  ws2812fx.setMode(11);                // FX_MODE_RAINBOW_CYCLE
+  ws2812fx.setBrightness(108);
+  ws2812fx.setSpeed(200);
+  ws2812fx.setColor(0xFF0000);         // colour arg unused by mode 11
+  ws2812fx.start();
 
-      char topic_cmd[128], topic1[128], topic2[128];
-      strncpy(topic_cmd, command_topic, sizeof(topic_cmd));
-      snprintf(topic1, sizeof(topic1), "matrigs/0/sta/%s/available", station_name);
-      snprintf(topic2, sizeof(topic2), "matrigs/0/dt/RTX/d/%s", station_name);
+  mqttHelloRunning = true;
+  mqttHelloStart   = millis();
 
-      client.subscribe(topic_cmd);
-      client.subscribe(topic1);
-      client.subscribe(topic2);
-      client.subscribe(topic_band_wildcard);   // per-band RX/TX state (needed for g_bandStates)
+  clientCmd.subscribe(command_topic);
 
-      // Keypad status is useful even when debug is disabled, so publish it
-      // directly to the debug topic after MQTT connects.
-      if (debug_topic[0]) {
-        char kmsg[96];
-        if (g_keypadPresent) {
-          snprintf(kmsg, sizeof(kmsg), "[Keypad] present @0x%02X (SDA=D2 SCL=D1 3.3V)", g_keypadI2cAddr);
-        } else {
-          snprintf(kmsg, sizeof(kmsg), "[Keypad] absent (expected 0x20..0x27, power=3.3V)");
-        }
-        client.publish(debug_topic, kmsg);
-      }
-
-      snprintf(logBuffer, sizeof(logBuffer), "Subscribed to command topic: %s", topic_cmd);
-      publishDebugMessage(logBuffer);
-      snprintf(logBuffer, sizeof(logBuffer), "Subscribed to: %s and %s", topic1, topic2);
-      publishDebugMessage(logBuffer);
-
-      snprintf(logBuffer, sizeof(logBuffer), "Hello %s", VER);
-      char feedbackTopic[100];
-      snprintf(feedbackTopic, sizeof(feedbackTopic), "pingpong/%s/fxresp", WiFi.macAddress().c_str());
-      client.publish(feedbackTopic, logBuffer);
-    }
+  // Keypad status is useful even when debug is disabled, so publish it
+  // directly to the debug topic after MQTT connects.
+  if (debug_topic[0]) {
+    char kmsg[96];
+    if (g_keypadPresent)
+      snprintf(kmsg, sizeof(kmsg), "[Keypad] present @0x%02X (SDA=D2 SCL=D1 3.3V)", g_keypadI2cAddr);
+    else
+      snprintf(kmsg, sizeof(kmsg), "[Keypad] absent (expected 0x20..0x27, power=3.3V)");
+    clientCmd.publish(debug_topic, kmsg);
   }
+
+  snprintf(logBuffer, sizeof(logBuffer), "Hello %s", VER);
+  if (feedback_topic[0])
+    clientCmd.publish(feedback_topic, logBuffer);
+}
+
+// --- MQTT reconnect (MatriGS broker: station state + antenna switching) ---
+static void reconnectMqttMatrigs()
+{
+  if (clientMatrigs.connected()) return;
+
+  Serial.println("Attempting MQTT MatriGS connection...");
+  char clientId[64];
+  snprintf(clientId, sizeof(clientId), "PingPong-MGS-%s", macAddress);
+
+  if (!clientMatrigs.connect(clientId)) return;
+
+  publishDebugMessage("[MQTT] MatriGS connected");
+
+  clientMatrigs.subscribe(topic_available);
+  clientMatrigs.subscribe(topic_dt);
+  clientMatrigs.subscribe(topic_band_wildcard);
 }
 
 /* ================================================================
@@ -704,8 +753,8 @@ static void selectAntennaByIndex(int idx, const char* source)
     }
 
     /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
-    if (!client.connected()) {
-        snprintf(msg, sizeof(msg), "[%sSelect] MQTT not connected", source);
+    if (!clientMatrigs.connected()) {
+        snprintf(msg, sizeof(msg), "[%sSelect] MatriGS MQTT not connected", source);
         publishDebugMessage(msg);
     } else if (currentSel == chosen) {
         snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
@@ -717,14 +766,14 @@ static void selectAntennaByIndex(int idx, const char* source)
             snprintf(topicR, sizeof(topicR),
                      "matrigs/0/sta/%s/b/%s/p:remove/%sANTENNAS",
                      station_name, currentBand.c_str(), currentRXTX);
-            client.publish(topicR, currentSel.c_str());
+            clientMatrigs.publish(topicR, currentSel.c_str());
         }
         /* add new */
         char topicA[128];
         snprintf(topicA, sizeof(topicA),
                  "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
                  station_name, currentBand.c_str(), currentRXTX);
-        client.publish(topicA, chosen.c_str());
+        clientMatrigs.publish(topicA, chosen.c_str());
     }
 
     /* ----------------------------------------------------------
@@ -934,9 +983,15 @@ void setup() {
   ws2812fx.setMode(FX_MODE_STATIC);
   ws2812fx.start();
 
-  client.setBufferSize(2048);
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
+  // MQTT Pingpong broker (LED commands + debug)
+  clientCmd.setBufferSize(512);
+  clientCmd.setServer(mqtt_server, mqtt_port);
+  clientCmd.setCallback(callback);
+
+  // MQTT MatriGS broker (station state + antenna switching)
+  clientMatrigs.setBufferSize(2048);
+  clientMatrigs.setServer(matrigs_server, matrigs_port);
+  clientMatrigs.setCallback(callback);
 }
 
 void loop() {
@@ -956,7 +1011,8 @@ void loop() {
 
   ws2812fx.service();
   server.handleClient();
-  client.loop();
+  clientCmd.loop();
+  clientMatrigs.loop();
 
   if (mqttHelloRunning && millis() - mqttHelloStart >= 5000) {
       ws2812fx.stop();
@@ -972,9 +1028,10 @@ void loop() {
       ws2812fx.setColor(0xFF0000);
       ws2812fx.start();
     }
-    if (client.connected()) {
+    if (clientCmd.connected() || clientMatrigs.connected()) {
       publishDebugMessage("Loop: WiFi lost, disconnecting MQTT.");
-      client.disconnect();
+      if (clientCmd.connected()) clientCmd.disconnect();
+      if (clientMatrigs.connected()) clientMatrigs.disconnect();
     }
   } else {
     if (WiFi.getMode() != WIFI_STA) {
@@ -985,8 +1042,9 @@ void loop() {
     }
   }
 
-  if (!client.connected() && (now - lastMQTTCheck > 5000)) {
+  if (WiFi.status() == WL_CONNECTED && (now - lastMQTTCheck > 5000)) {
     lastMQTTCheck = now;
-    reconnectMQTT();
+    reconnectMqttCmd();
+    reconnectMqttMatrigs();
   }
 }

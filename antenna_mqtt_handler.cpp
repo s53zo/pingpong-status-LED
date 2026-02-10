@@ -20,7 +20,7 @@
 /* ------------------------------------------------------------------
  *  Globals declared in the main sketch
  * ---------------------------------------------------------------- */
-extern PubSubClient              client;
+extern PubSubClient              clientMatrigs;
 extern char                      currentRXTX[4];
 extern std::vector<String>       currentAntList;
 extern String                    currentBand;
@@ -236,8 +236,8 @@ void handleCurrentBandJSON(const char* json)
                  "matrigs/0/sta/%s/b/%s/p:add/TXANTENNAS",
                  station_name, g_pendingTx.band.c_str());
 
-        client.publish(topicR, g_pendingTx.oldAnt.c_str());
-        client.publish(topicA, g_pendingTx.newAnt.c_str());
+        clientMatrigs.publish(topicR, g_pendingTx.oldAnt.c_str());
+        clientMatrigs.publish(topicA, g_pendingTx.newAnt.c_str());
 
         publishDebugMessage("[TX-Queue] ▶ executed queued TX change");
         g_pendingTx.valid = false;            // clear queue
