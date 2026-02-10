@@ -244,6 +244,12 @@ void handleCurrentBandJSON(const char* json)
     }
     g_txActive = newTxActive;                 // remember current PTT state
 
+    /* update currentRXTX if TARGET present */
+    if (doc.containsKey("TARGET")) {
+        const char* rxtx = doc["TARGET"]["RXTX"] | "";
+        strncpy(currentRXTX, rxtx, sizeof(currentRXTX) - 1);
+    }
+
     const char* band = doc["BANDS"] | "?";
 
     // When MatriGS reports OFFLINE it may send BANDS="-" (no current band).
@@ -259,12 +265,6 @@ void handleCurrentBandJSON(const char* json)
     warnedNoBand = false;
 
     String ants      = listAntennasForBand(band); // sorted antennas
-
-    /* update currentRXTX if TARGET present */
-    if (doc.containsKey("TARGET")) {
-        const char* rxtx = doc["TARGET"]["RXTX"] | "";
-        strncpy(currentRXTX, rxtx, sizeof(currentRXTX) - 1);
-    }
 
     /* dedup: recompute hash of antenna string */
     uint32_t hash = 5381;
