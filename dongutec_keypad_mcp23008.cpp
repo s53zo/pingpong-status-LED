@@ -57,7 +57,13 @@ int8_t DongutecKeypadMcp23008::readKeyIndex()
   if (!readReg(REG_GPIO, &v_lo)) return -2;
 
   uint8_t combined = v_hi | v_lo;
-  return _lookup[combined];  // -1 if nothing/unknown/multi-key
+  if (combined == 0) return -1;
+
+  const int8_t key = _lookup[combined];
+  if (key >= 0) return key;
+
+  // More than one key (or ghost/ambiguous matrix state).
+  return -3;
 }
 
 bool DongutecKeypadMcp23008::writeReg(uint8_t reg, uint8_t value)
@@ -81,4 +87,3 @@ bool DongutecKeypadMcp23008::readReg(uint8_t reg, uint8_t* out)
   *out = (uint8_t)_wire->read();
   return true;
 }
-

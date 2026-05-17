@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v1.47 jul 2025 S53ZO"
+#define VER "v2.14 feb2026 i2c"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -877,13 +877,14 @@ static void handleKeypad()
     static int8_t   candidateKey = -1;
     static uint32_t candidateSince = 0;
     static int8_t   debouncedKey = -1;
+    static bool     multiActive = false;
 
     const uint32_t now = millis();
     if (now - lastPoll < KEYPAD_POLL_MS) return;
     lastPoll = now;
 
     const int8_t rawKey = g_keypad.readKeyIndex();
-    if (rawKey < -1) {
+    if (rawKey == -2) {
         static uint32_t lastErr = 0;
         if (debugEnabled && now - lastErr > 2000) {
             publishDebugMessage("[Keypad] I2C error (check wiring/address)");
@@ -891,6 +892,19 @@ static void handleKeypad()
         }
         return;
     }
+
+    if (rawKey == -3) {
+        if (!multiActive) {
+            publishDebugMessageAlways("[Keypad] multi-key press detected (ignored)");
+            multiActive = true;
+        }
+        // Cancel any in-progress debounce while multiple keys are held.
+        candidateKey = -1;
+        debouncedKey = -1;
+        candidateSince = now;
+        return;
+    }
+    multiActive = false;
 
     if (rawKey != candidateKey) {
         candidateKey = rawKey;

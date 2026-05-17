@@ -16,8 +16,9 @@ public:
 
   // Returns:
   // -  0..15 : key index (layout depends on wiring/orientation)
-  // - -1     : no (single) key detected
+  // - -1     : no key detected
   // - -2     : I2C error
+  // - -3     : multi-key / ambiguous matrix state
   int8_t readKeyIndex();
 
 private:
@@ -30,4 +31,3 @@ private:
 };
 
 #endif  // DONGUTEC_KEYPAD_MCP23008_H
-
