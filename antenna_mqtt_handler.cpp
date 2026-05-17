@@ -40,9 +40,19 @@ DynamicJsonDocument availableDoc(4096);
 /* ── global: band ➜ {rx,tx} cache ─────────────────────────────── */
 std::map<String, BandState> g_bandStates; 
 
+static void updateCurrentRxTx(const char* value, const char* source)
+{
+    if (!value || !value[0]) return;
+    if (strcmp(value, "RX") != 0 && strcmp(value, "TX") != 0) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "[%s] ignored invalid RXTX=%s", source, value);
+        publishDebugMessage(dbg);
+        return;
+    }
 
-
-
+    strncpy(currentRXTX, value, sizeof(currentRXTX) - 1);
+    currentRXTX[sizeof(currentRXTX) - 1] = '\0';
+}
 
 /* ================================================================
  *  Helper: natural alphanumeric compare ("A1" < "A2" < "A10")
@@ -227,6 +237,17 @@ void handleAvailableJSON(const char* json)
 }
 
 /* ================================================================
+ *  “…/sta/<station>” handler (selected RX/TX antenna bank)
+ * ===============================================================*/
+void handleStationStateJSON(const char* json)
+{
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, json)) return;
+
+    updateCurrentRxTx(doc["RXTX"] | "", "StationState");
+}
+
+/* ================================================================
  *  “…/dt/<station>/current” handler (band + target RX/TX)
  * ===============================================================*/
 void handleCurrentBandJSON(const char* json)
@@ -239,13 +260,12 @@ void handleCurrentBandJSON(const char* json)
     DynamicJsonDocument doc(1024);
     if (deserializeJson(doc, json)) return;       // bad JSON → ignore
 
-    extern bool g_txActive;                   // add extern near top
-    const char* liveState = doc["RXTX"] | ""; // field sent by MatriGS
-    bool newTxActive = (strcmp(liveState, "TX") == 0);
+    const char* liveState = doc["RXTX"] | ""; // optional live PTT state
+    const bool hasLiveState =
+        (strcmp(liveState, "RX") == 0 || strcmp(liveState, "TX") == 0);
 
     /* if we just fell back to RX, flush any queued command ---- */
-    extern PendingTxChange g_pendingTx;
-    if (g_txActive && !newTxActive && g_pendingTx.valid) {
+    if (hasLiveState && g_txActive && strcmp(liveState, "RX") == 0 && g_pendingTx.valid) {
 
         /* build /p:remove + /p:add exactly like in handleSerialCommands */
         char topicR[128], topicA[128];
@@ -262,13 +282,9 @@ void handleCurrentBandJSON(const char* json)
         publishDebugMessage("[TX-Queue] ▶ executed queued TX change");
         g_pendingTx.valid = false;            // clear queue
     }
-    g_txActive = newTxActive;                 // remember current PTT state
 
-    /* update currentRXTX if TARGET present */
-    if (doc.containsKey("TARGET")) {
-        const char* rxtx = doc["TARGET"]["RXTX"] | "";
-        strncpy(currentRXTX, rxtx, sizeof(currentRXTX) - 1);
-    }
+    if (hasLiveState)
+        g_txActive = (strcmp(liveState, "TX") == 0);  // remember current PTT state
 
     const char* targetBand = doc["TARGET"]["BAND"] | "";
     const char* bandsField = doc["BANDS"] | "?";

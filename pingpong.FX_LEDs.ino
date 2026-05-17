@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.15 may2026 bandfix"
+#define VER "v2.16 may2026 rxtx"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -96,6 +96,7 @@ std::vector<String> currentAntList;
 std::map<String,String> bandCache;    // band ➜ sorted antenna list
 
 char topic_cmd[128];
+char topic_station_state[128];
 char topic_available[128];
 char topic_dt[128];
 
@@ -247,6 +248,10 @@ void handleRoot()
   server.sendContent(line);
 
   snprintf(line, sizeof(line),
+           "<li>Selected antenna bank: %s</li>", currentRXTX);
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
            "<li>Antennas for band: %s</li>", currentAntennas.c_str());
   server.sendContent(line);
 
@@ -391,6 +396,9 @@ void setupWiFi()
     snprintf(topic_available, sizeof(topic_available),
              "matrigs/0/sta/%s/available", station_name);
 
+    snprintf(topic_station_state, sizeof(topic_station_state),
+             "matrigs/0/sta/%s", station_name);
+
     snprintf(topic_dt, sizeof(topic_dt),          // ← correct legacy feed
              "matrigs/0/dt/RTX/d/%s", station_name);
 
@@ -405,6 +413,7 @@ void setupWiFi()
     Serial.print("Command topic: ");  Serial.println(command_topic);
     Serial.print("Feedback topic: "); Serial.println(feedback_topic);
     Serial.print("Debug topic: ");    Serial.println(debug_topic);
+    Serial.print("Sub → ");           Serial.println(topic_station_state);
     Serial.print("Sub → ");           Serial.println(topic_available);
     Serial.print("Sub → ");           Serial.println(topic_dt);
     Serial.print("Sub → ");           Serial.println(topic_band_wildcard);
@@ -564,15 +573,23 @@ void callback(char* topic, byte* payload, unsigned int length)
     bool handled = false;                             // fall-through flag
 
     /* --------------------------------------------------------------
-     *  1. “…/sta/<station>/available”
+     *  1. “…/sta/<station>”
      * -------------------------------------------------------------*/
-    if (strcmp(topicCopy, topic_available) == 0) {
+    if (strcmp(topicCopy, topic_station_state) == 0) {
+        handleStationStateJSON(msg);
+        handled = true;
+    }
+
+    /* --------------------------------------------------------------
+     *  2. “…/sta/<station>/available”
+     * -------------------------------------------------------------*/
+    else if (strcmp(topicCopy, topic_available) == 0) {
         handleAvailableJSON(msg);
         handled = true;
     }
 
     /* --------------------------------------------------------------
-     *  2. legacy “…/dt/RTX/d/<station>”
+     *  3. legacy “…/dt/RTX/d/<station>”
      * -------------------------------------------------------------*/
     else if (strcmp(topicCopy, topic_dt) == 0) {
         handleCurrentBandJSON(msg);
@@ -580,7 +597,7 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 
     /* --------------------------------------------------------------
-     *  3. per-band live JSON “…/sta/<station>/b/<Band>”
+     *  4. per-band live JSON “…/sta/<station>/b/<Band>”
      * -------------------------------------------------------------*/
     else if (strncmp(topicCopy, topic_band_prefix,
                      strlen(topic_band_prefix)) == 0) {
@@ -595,7 +612,7 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 
     /* --------------------------------------------------------------
-     *  4. LED FX commands  pingpong/<MAC>/fxcmd
+     *  5. LED FX commands  pingpong/<MAC>/fxcmd
      * -------------------------------------------------------------*/
     else if (strcmp(topicCopy, command_topic) == 0) {
 
@@ -627,7 +644,7 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 
     /* --------------------------------------------------------------
-     *  5. unknown / unhandled topic
+     *  6. unknown / unhandled topic
      * -------------------------------------------------------------*/
     if (!handled) {
         char dbg[192];
@@ -690,6 +707,7 @@ static void reconnectMqttMatrigs()
 
   publishDebugMessage("[MQTT] MatriGS connected");
 
+  clientMatrigs.subscribe(topic_station_state);
   clientMatrigs.subscribe(topic_available);
   clientMatrigs.subscribe(topic_dt);
   clientMatrigs.subscribe(topic_band_wildcard);

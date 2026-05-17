@@ -18,6 +18,7 @@ extern std::map<String, BandState> g_bandStates;    // NEW  (band ➜ state)
 
 /* ---------- MQTT-callback helpers ------------------------------ */
 void handleAvailableJSON(const char* json);         // “…/sta/<station>/available”
+void handleStationStateJSON(const char* json);      // “…/sta/<station>”
 void handleCurrentBandJSON(const char* json);       // legacy “…/dt/<station>/current”
 void handleBandStateJSON(const char* band,
                           const char* json);        // NEW “…/sta/<sta>/b/<Band>”
