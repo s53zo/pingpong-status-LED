@@ -164,20 +164,18 @@ void handleBandStateJSON(const char* band, const char* json)       // NEW
     else
         st.tx = "";
 
-    /* keep the public “currentBand” in sync so the UI stays sane */
-    extern String currentBand;
-    currentBand = band;
-
-    // Also keep the antenna list in sync for the UI and keypad selection.
-    // This is important when the legacy DT feed reports BANDS="-" (OFFLINE),
-    // because then `handleCurrentBandJSON()` won't refresh `currentAntennas`.
-    String ants = listAntennasForBand(band);
-    if (ants.length()) {
-        currentAntennas = ants;
-        currentAntList  = getCurrentAntList();
-    } else {
-        currentAntennas = "?";
-        currentAntList.clear();
+    // Per-band retained state is not proof that this is the active band.
+    // Only the DT feed owns currentBand; /b/<band> refreshes UI/keypad data
+    // when it belongs to the already-active band.
+    if (currentBand == band) {
+        String ants = listAntennasForBand(band);
+        if (ants.length()) {
+            currentAntennas = ants;
+            currentAntList  = getCurrentAntList();
+        } else {
+            currentAntennas = "?";
+            currentAntList.clear();
+        }
     }
 }
 
@@ -194,7 +192,7 @@ void handleAvailableJSON(const char* json)
         return;
     }
 
-    // If we already know the current band (eg from retained per-band JSON),
+    // If we already know the current band (eg from retained DT state),
     // refresh the current antenna list so the web UI stays useful.
     if (currentBand.length() && currentBand != "?" && currentBand != "-") {
         String ants = listAntennasForBand(currentBand.c_str());
@@ -272,11 +270,14 @@ void handleCurrentBandJSON(const char* json)
         strncpy(currentRXTX, rxtx, sizeof(currentRXTX) - 1);
     }
 
-    const char* band = doc["BANDS"] | "?";
+    const char* targetBand = doc["TARGET"]["BAND"] | "";
+    const char* bandsField = doc["BANDS"] | "?";
+    const char* band = targetBand;
+    if (!band[0] || strcmp(band, "?") == 0 || strcmp(band, "-") == 0)
+        band = bandsField;
 
     // When MatriGS reports OFFLINE it may send BANDS="-" (no current band).
-    // Keep the last valid `currentBand` (often set via retained per-band state)
-    // so keypad selection and UI remain usable.
+    // Keep the last valid `currentBand` so keypad selection and UI remain usable.
     if (!band || !band[0] || strcmp(band, "?") == 0 || strcmp(band, "-") == 0) {
         if (!warnedNoBand) {
             publishDebugMessage("[BandChange] BANDS not set (\"-\") - keeping last known band");
