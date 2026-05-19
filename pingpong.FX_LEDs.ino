@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.16 may2026 rxtx"
+#define VER "v2.19 may2026 mqtt5"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -804,36 +804,43 @@ static void selectAntennaByIndex(int idx, const char* source)
     }
 
     /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
-    if (!clientMatrigs.connected()) {
-        snprintf(msg, sizeof(msg), "[%sSelect] MatriGS MQTT not connected", source);
-        pub(msg);
-    } else if (currentSel == chosen) {
+    bool publishSent = false;
+    if (currentSel == chosen) {
         snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
         pub(msg);
+        publishSent = true;
     } else {
-        /* remove old (if any) */
-        if (currentSel.length()) {
-            char topicR[128];
-            snprintf(topicR, sizeof(topicR),
-                     "matrigs/0/sta/%s/b/%s/p:remove/%sANTENNAS",
-                     station_name, currentBand.c_str(), currentRXTX);
-            clientMatrigs.publish(topicR, currentSel.c_str());
+        bool usedFallback = false;
+        char publishError[160] = "";
+        bool sent = publishMatrigsAntennaSetCommand(
+            currentBand.c_str(), currentRXTX,
+            currentSel.c_str(), chosen.c_str(),
+            &usedFallback, publishError, sizeof(publishError));
+
+        if (sent && usedFallback) {
+            snprintf(msg, sizeof(msg), "[%sSelect] used remove/add fallback", source);
+            pub(msg);
+            publishSent = true;
+        } else if (sent) {
+            snprintf(msg, sizeof(msg), "[%sSelect] sent MQTT5 p:set", source);
+            pub(msg);
+            publishSent = true;
+        } else {
+            snprintf(msg, sizeof(msg), "[%sSelect] publish failed: %s",
+                     source, publishError[0] ? publishError : "unknown error");
+            pub(msg);
         }
-        /* add new */
-        char topicA[128];
-        snprintf(topicA, sizeof(topicA),
-                 "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
-                 station_name, currentBand.c_str(), currentRXTX);
-        clientMatrigs.publish(topicA, chosen.c_str());
     }
 
     /* ----------------------------------------------------------
      *  3️⃣ update cache -----------------------------------------
      * ---------------------------------------------------------*/
-    if (currentRXTX[0] == 'R')
-        g_bandStates[currentBand].rx = chosen;
-    else
-        g_bandStates[currentBand].tx = chosen;
+    if (publishSent) {
+        if (currentRXTX[0] == 'R')
+            g_bandStates[currentBand].rx = chosen;
+        else
+            g_bandStates[currentBand].tx = chosen;
+    }
 }
 
 static bool parseUnsignedInt(const String& s, int* out)
@@ -1079,6 +1086,7 @@ void loop() {
   server.handleClient();
   clientCmd.loop();
   clientMatrigs.loop();
+  serviceAntennaMqttTasks();
 
   if (mqttHelloRunning && millis() - mqttHelloStart >= 5000) {
       ws2812fx.stop();

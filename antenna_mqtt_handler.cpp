@@ -8,6 +8,7 @@
  */
 
 #include "antenna_mqtt_handler.h"
+#include "mqtt5_json_publisher.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -29,6 +30,9 @@ extern std::map<String, String>  bandCache;
 extern bool            g_txActive;
 extern PendingTxChange g_pendingTx;
 extern char            station_name[];
+extern char            matrigs_server[];
+extern int             matrigs_port;
+extern char            macAddress[];
 
 
 /* Publish-to-MQTT debug helper (implemented in the sketch) */
@@ -39,6 +43,143 @@ DynamicJsonDocument availableDoc(4096);
 
 /* ── global: band ➜ {rx,tx} cache ─────────────────────────────── */
 std::map<String, BandState> g_bandStates; 
+
+static PendingTxChange s_deferredTxChange = { "", "", "", false };
+static uint32_t s_lastDeferredTxAttemptMs = 0;
+static uint32_t s_lastMqtt5FailureMs = 0;
+static constexpr uint32_t DEFERRED_TX_RETRY_MS = 2000;
+static constexpr uint32_t MQTT5_RETRY_DELAY_MS = 10000;
+
+static String makeSingleAntennaJsonArray(const char* antenna)
+{
+    String payload;
+    payload.reserve(strlen(antenna) + 6);
+    payload += F("[\"");
+    for (const char* p = antenna; *p; ++p) {
+        if (*p == '"' || *p == '\\') payload += '\\';
+        payload += *p;
+    }
+    payload += F("\"]");
+    return payload;
+}
+
+static bool publishRemoveAddFallback(const char* band,
+                                     const char* bank,
+                                     const char* oldAnt,
+                                     const char* newAnt)
+{
+    if (!clientMatrigs.connected()) return false;
+
+    bool ok = true;
+    if (oldAnt && oldAnt[0]) {
+        char topicR[160];
+        snprintf(topicR, sizeof(topicR),
+                 "matrigs/0/sta/%s/b/%s/p:remove/%sANTENNAS",
+                 station_name, band, bank);
+        ok = clientMatrigs.publish(topicR, oldAnt) && ok;
+    }
+
+    char topicA[160];
+    snprintf(topicA, sizeof(topicA),
+             "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
+             station_name, band, bank);
+    ok = clientMatrigs.publish(topicA, newAnt) && ok;
+
+    return ok;
+}
+
+bool publishMatrigsAntennaSetCommand(const char* band,
+                                     const char* bank,
+                                     const char* oldAnt,
+                                     const char* newAnt,
+                                     bool* usedFallback,
+                                     char* error,
+                                     size_t errorLen)
+{
+    if (usedFallback) *usedFallback = false;
+    if (error && errorLen) error[0] = '\0';
+
+    if (!band || !band[0] || !bank || !bank[0] || !newAnt || !newAnt[0]) {
+        if (error && errorLen)
+            snprintf(error, errorLen, "missing antenna set argument");
+        return false;
+    }
+
+    char topic[160];
+    snprintf(topic, sizeof(topic),
+             "matrigs/0/sta/%s/b/%s/p:set/%sANTENNAS",
+             station_name, band, bank);
+
+    char clientId[64];
+    snprintf(clientId, sizeof(clientId), "PingPong-MGS5-%s", macAddress);
+
+    String payload = makeSingleAntennaJsonArray(newAnt);
+    char mqtt5Error[128] = "";
+    bool shouldTryMqtt5 =
+        s_lastMqtt5FailureMs == 0 ||
+        static_cast<uint32_t>(millis() - s_lastMqtt5FailureMs) >= MQTT5_RETRY_DELAY_MS ||
+        !clientMatrigs.connected();
+
+    if (shouldTryMqtt5) {
+        if (mqtt5PublishJson(matrigs_server, static_cast<uint16_t>(matrigs_port),
+                             clientId, topic, payload.c_str(),
+                             mqtt5Error, sizeof(mqtt5Error))) {
+            s_lastMqtt5FailureMs = 0;
+            return true;
+        }
+        s_lastMqtt5FailureMs = millis();
+    } else {
+        snprintf(mqtt5Error, sizeof(mqtt5Error),
+                 "suppressed after recent MQTT5 failure");
+    }
+
+    if (usedFallback) *usedFallback = true;
+    if (publishRemoveAddFallback(band, bank, oldAnt, newAnt)) {
+        if (error && errorLen)
+            snprintf(error, errorLen, "MQTT5 failed: %s; used remove/add fallback",
+                     mqtt5Error);
+        return true;
+    }
+
+    if (error && errorLen)
+        snprintf(error, errorLen, "MQTT5 failed: %s; remove/add fallback failed",
+                 mqtt5Error);
+    return false;
+}
+
+void serviceAntennaMqttTasks()
+{
+    if (!s_deferredTxChange.valid) return;
+
+    uint32_t now = millis();
+    if (s_lastDeferredTxAttemptMs &&
+        static_cast<uint32_t>(now - s_lastDeferredTxAttemptMs) < DEFERRED_TX_RETRY_MS) {
+        return;
+    }
+    s_lastDeferredTxAttemptMs = now;
+
+    bool usedFallback = false;
+    char publishError[160] = "";
+    bool sent = publishMatrigsAntennaSetCommand(
+        s_deferredTxChange.band.c_str(), "TX",
+        s_deferredTxChange.oldAnt.c_str(), s_deferredTxChange.newAnt.c_str(),
+        &usedFallback, publishError, sizeof(publishError));
+
+    if (sent && usedFallback) {
+        publishDebugMessage("[TX-Queue] executed queued TX change via remove/add fallback");
+        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newAnt;
+        s_deferredTxChange.valid = false;
+        s_lastDeferredTxAttemptMs = 0;
+    } else if (sent) {
+        publishDebugMessage("[TX-Queue] executed queued TX change via MQTT5 p:set");
+        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newAnt;
+        s_deferredTxChange.valid = false;
+        s_lastDeferredTxAttemptMs = 0;
+    } else {
+        publishDebugMessage(publishError[0] ? publishError
+                                            : "[TX-Queue] queued TX change publish failed");
+    }
+}
 
 static void updateCurrentRxTx(const char* value, const char* source)
 {
@@ -267,20 +408,10 @@ void handleCurrentBandJSON(const char* json)
     /* if we just fell back to RX, flush any queued command ---- */
     if (hasLiveState && g_txActive && strcmp(liveState, "RX") == 0 && g_pendingTx.valid) {
 
-        /* build /p:remove + /p:add exactly like in handleSerialCommands */
-        char topicR[128], topicA[128];
-        snprintf(topicR, sizeof(topicR),
-                 "matrigs/0/sta/%s/b/%s/p:remove/TXANTENNAS",
-                 station_name, g_pendingTx.band.c_str());
-        snprintf(topicA, sizeof(topicA),
-                 "matrigs/0/sta/%s/b/%s/p:add/TXANTENNAS",
-                 station_name, g_pendingTx.band.c_str());
-
-        clientMatrigs.publish(topicR, g_pendingTx.oldAnt.c_str());
-        clientMatrigs.publish(topicA, g_pendingTx.newAnt.c_str());
-
-        publishDebugMessage("[TX-Queue] ▶ executed queued TX change");
-        g_pendingTx.valid = false;            // clear queue
+        s_deferredTxChange = g_pendingTx;
+        s_deferredTxChange.valid = true;
+        g_pendingTx.valid = false;
+        publishDebugMessage("[TX-Queue] deferred queued TX change until MQTT callback returns");
     }
 
     if (hasLiveState)

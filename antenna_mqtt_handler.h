@@ -22,10 +22,18 @@ void handleStationStateJSON(const char* json);      // “…/sta/<station>”
 void handleCurrentBandJSON(const char* json);       // legacy “…/dt/<station>/current”
 void handleBandStateJSON(const char* band,
                           const char* json);        // NEW “…/sta/<sta>/b/<Band>”
+void serviceAntennaMqttTasks();
 
 /* ---------- antenna helpers ------------------------------------ */
 std::vector<String> getCurrentAntList();            // returns {"A1-40", …}
 String listAntennasForBand(const char* band);       // "B80" → "A1-80 A3-80 …"
+bool publishMatrigsAntennaSetCommand(const char* band,
+                                      const char* bank,
+                                      const char* oldAnt,
+                                      const char* newAnt,
+                                      bool* usedFallback,
+                                      char* error,
+                                      size_t errorLen);
 
 /* ---------------- shared TX-queue support -------------------- */
 struct PendingTxChange {
