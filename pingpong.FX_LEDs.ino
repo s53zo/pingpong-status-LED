@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.19 may2026 mqtt5"
+#define VER "v2.21 may2026 chord"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -80,7 +80,7 @@ unsigned long mqttHelloStart = 0;
 bool g_txActive = false;
 
 /* ---------- pending TX change instance ------------------------ */
-PendingTxChange g_pendingTx = { "", "", "", false };
+PendingTxChange g_pendingTx;
 
 
 
@@ -753,68 +753,91 @@ static void refreshAntennaListForCurrentBandIfNeeded()
     lastBand        = currentBand;
 }
 
-// idx:
-// - 0     => LOAD-2KA dummy load
-// - 1..N  => currentAntList[idx-1]
-static void selectAntennaByIndex(int idx, const char* source)
+static bool antennaLineupsEqual(const std::vector<String>& a,
+                                const std::vector<String>& b)
 {
-    if (idx < 0) return;
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+static String formatAntennaLineup(const std::vector<String>& lineup)
+{
+    String out;
+    for (size_t i = 0; i < lineup.size(); ++i) {
+        if (i) out += '+';
+        out += lineup[i];
+    }
+    if (!out.length()) out = F("-");
+    return out;
+}
+
+static bool antennaNameForSelectionIndex(int idx, String* out)
+{
+    if (!out || idx < 0) return false;
+
+    if (idx == 0) {
+        *out = F("LOAD-2KA");
+        return true;
+    }
+
+    if (idx <= (int)currentAntList.size()) {
+        *out = currentAntList[idx - 1];
+        return true;
+    }
+
+    return false;
+}
+
+static void selectAntennaLineup(const std::vector<String>& chosenLineup,
+                                const char* source)
+{
+    if (chosenLineup.empty()) return;
 
     void (*pub)(const char*) = publishDebugMessage;
     if (source && strcmp(source, "Keypad") == 0)
         pub = publishDebugMessageAlways;
 
-    refreshAntennaListForCurrentBandIfNeeded();
-
-    /* map index to antenna name -------------------------------- */
-    String chosen;
-    if (idx == 0) {
-        chosen = F("LOAD-2KA");               // dummy load
-    } else if (idx <= (int)currentAntList.size()) {
-        chosen = currentAntList[idx - 1];     // 1-based → 0-based
-    } else {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "[%sSelect] Invalid antenna index %d (max %d) band=%s",
-                 source, idx, (int)currentAntList.size(), currentBand.c_str());
-        pub(msg);
-        return;
-    }
-
+    String chosenText = formatAntennaLineup(chosenLineup);
     char msg[192];
     snprintf(msg, sizeof(msg), "[%sSelect] %s band=%s -> %s",
-             source, currentRXTX, currentBand.c_str(), chosen.c_str());
+             source, currentRXTX, currentBand.c_str(), chosenText.c_str());
     pub(msg);
 
-    /* find currently active antenna in this bank --------------- */
-    BandState curState   = g_bandStates[currentBand];
-    String    currentSel = (currentRXTX[0] == 'R') ? curState.rx
-                                                   : curState.tx;
+    BandState curState = g_bandStates[currentBand];
+    std::vector<String> currentLineup =
+        (currentRXTX[0] == 'R') ? curState.rx : curState.tx;
 
-    /* 1️⃣ TX bank & PTT active  →  queue change ---------------- */
     if (currentRXTX[0] == 'T' && g_txActive) {
-        g_pendingTx.band   = currentBand;
-        g_pendingTx.oldAnt = currentSel;
-        g_pendingTx.newAnt = chosen;
-        g_pendingTx.valid  = true;
+        if (antennaLineupsEqual(currentLineup, chosenLineup)) {
+            snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
+            pub(msg);
+            return;
+        }
+
+        g_pendingTx.band = currentBand;
+        g_pendingTx.oldLineup = currentLineup;
+        g_pendingTx.newLineup = chosenLineup;
+        g_pendingTx.valid = true;
 
         snprintf(msg, sizeof(msg), "[TX-Queue] queued via %s until RTX returns to RX", source);
         pub(msg);
         return;
     }
 
-    /* 2️⃣ publish immediately (RX, or TX while in RX) ---------- */
     bool publishSent = false;
-    if (currentSel == chosen) {
+    if (antennaLineupsEqual(currentLineup, chosenLineup)) {
         snprintf(msg, sizeof(msg), "[%sSelect] already active", source);
         pub(msg);
         publishSent = true;
     } else {
         bool usedFallback = false;
         char publishError[160] = "";
-        bool sent = publishMatrigsAntennaSetCommand(
+        bool sent = publishMatrigsAntennaLineupCommand(
             currentBand.c_str(), currentRXTX,
-            currentSel.c_str(), chosen.c_str(),
+            currentLineup, chosenLineup,
             &usedFallback, publishError, sizeof(publishError));
 
         if (sent && usedFallback) {
@@ -832,15 +855,40 @@ static void selectAntennaByIndex(int idx, const char* source)
         }
     }
 
-    /* ----------------------------------------------------------
-     *  3️⃣ update cache -----------------------------------------
-     * ---------------------------------------------------------*/
     if (publishSent) {
         if (currentRXTX[0] == 'R')
-            g_bandStates[currentBand].rx = chosen;
+            g_bandStates[currentBand].rx = chosenLineup;
         else
-            g_bandStates[currentBand].tx = chosen;
+            g_bandStates[currentBand].tx = chosenLineup;
     }
+}
+
+// idx:
+// - 0     => LOAD-2KA dummy load
+// - 1..N  => currentAntList[idx-1]
+static void selectAntennaByIndex(int idx, const char* source)
+{
+    if (idx < 0) return;
+
+    void (*pub)(const char*) = publishDebugMessage;
+    if (source && strcmp(source, "Keypad") == 0)
+        pub = publishDebugMessageAlways;
+
+    refreshAntennaListForCurrentBandIfNeeded();
+
+    String chosen;
+    if (!antennaNameForSelectionIndex(idx, &chosen)) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "[%sSelect] Invalid antenna index %d (max %d) band=%s",
+                 source, idx, (int)currentAntList.size(), currentBand.c_str());
+        pub(msg);
+        return;
+    }
+
+    std::vector<String> chosenLineup;
+    chosenLineup.push_back(chosen);
+    selectAntennaLineup(chosenLineup, source);
 }
 
 static bool parseUnsignedInt(const String& s, int* out)
@@ -894,22 +942,135 @@ static int keypadSelectionIndexFromLabel(char label)
     }
 }
 
+static uint8_t countKeyMaskBits(uint16_t mask)
+{
+    uint8_t count = 0;
+    while (mask) {
+        count += mask & 1u;
+        mask >>= 1;
+    }
+    return count;
+}
+
+static int firstKeyIndexFromMask(uint16_t mask)
+{
+    for (int key = 0; key < 16; ++key) {
+        if (mask & (1u << key)) return key;
+    }
+    return -1;
+}
+
+static void appendToBuffer(char* out, size_t outLen, const char* text)
+{
+    if (!out || outLen == 0 || !text) return;
+    const size_t used = strlen(out);
+    if (used >= outLen - 1) return;
+    strncat(out, text, outLen - used - 1);
+}
+
+static void formatKeyMaskLabels(uint16_t mask, char* out, size_t outLen)
+{
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+
+    bool first = true;
+    for (int key = 0; key < 16; ++key) {
+        if ((mask & (1u << key)) == 0) continue;
+
+        char piece[4];
+        snprintf(piece, sizeof(piece), "%s%c", first ? "" : "+",
+                 keypadLabelFromKeyIndex(key));
+        appendToBuffer(out, outLen, piece);
+        first = false;
+    }
+
+    if (!out[0]) appendToBuffer(out, outLen, "-");
+}
+
+static bool antennaLineupContains(const std::vector<String>& lineup, const String& antenna)
+{
+    for (const auto& item : lineup) {
+        if (item == antenna) return true;
+    }
+    return false;
+}
+
+static void handleKeypadChord(uint16_t mask, bool ghostRisk)
+{
+    char labels[48];
+    formatKeyMaskLabels(mask, labels, sizeof(labels));
+
+    if (ghostRisk) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "[KeypadChord] ignored ghost-risk chord mask=0x%04X candidates=%s",
+                 mask, labels);
+        publishDebugMessageAlways(msg);
+        return;
+    }
+
+    refreshAntennaListForCurrentBandIfNeeded();
+
+    std::vector<String> chosenLineup;
+    uint8_t ignored = 0;
+    for (int key = 0; key < 16; ++key) {
+        if ((mask & (1u << key)) == 0) continue;
+
+        const char label = keypadLabelFromKeyIndex(key);
+        const int idx = keypadSelectionIndexFromLabel(label);
+
+        String antenna;
+        if (!antennaNameForSelectionIndex(idx, &antenna)) {
+            ++ignored;
+            continue;
+        }
+
+        if (!antennaLineupContains(chosenLineup, antenna))
+            chosenLineup.push_back(antenna);
+    }
+
+    if (chosenLineup.size() < 2) {
+        char msg[176];
+        snprintf(msg, sizeof(msg),
+                 "[KeypadChord] ignored mask=0x%04X candidates=%s valid=%u ignored=%u",
+                 mask, labels, (unsigned)chosenLineup.size(), ignored);
+        publishDebugMessageAlways(msg);
+        return;
+    }
+
+    String lineupText = formatAntennaLineup(chosenLineup);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+             "[KeypadChord] accepted mask=0x%04X candidates=%s lineup=%s",
+             mask, labels, lineupText.c_str());
+    publishDebugMessageAlways(msg);
+
+    selectAntennaLineup(chosenLineup, "Keypad");
+}
+
 static void handleKeypad()
 {
     if (!g_keypadPresent) return;
 
     static uint32_t lastPoll = 0;
-    static int8_t   candidateKey = -1;
+    static uint16_t candidateMask = 0;
+    static uint8_t  candidateRows = 0;
+    static uint8_t  candidateCols = 0;
+    static bool     candidateGhostRisk = false;
     static uint32_t candidateSince = 0;
-    static int8_t   debouncedKey = -1;
-    static bool     multiActive = false;
+    static uint16_t debouncedMask = 0;
+    static bool     chordSessionActive = false;
+    static bool     chordSuppressLogged = false;
 
     const uint32_t now = millis();
     if (now - lastPoll < KEYPAD_POLL_MS) return;
     lastPoll = now;
 
-    const int8_t rawKey = g_keypad.readKeyIndex();
-    if (rawKey == -2) {
+    uint16_t rawMask = 0;
+    uint8_t rows = 0;
+    uint8_t cols = 0;
+    bool ghostRisk = false;
+    if (!g_keypad.readKeyMask(&rawMask, &rows, &cols, &ghostRisk)) {
         static uint32_t lastErr = 0;
         if (debugEnabled && now - lastErr > 2000) {
             publishDebugMessage("[Keypad] I2C error (check wiring/address)");
@@ -918,39 +1079,51 @@ static void handleKeypad()
         return;
     }
 
-    if (rawKey == -3) {
-        if (!multiActive) {
-            publishDebugMessageAlways("[Keypad] multi-key press detected (ignored)");
-            multiActive = true;
-        }
-        // Cancel any in-progress debounce while multiple keys are held.
-        candidateKey = -1;
-        debouncedKey = -1;
-        candidateSince = now;
-        return;
-    }
-    multiActive = false;
-
-    if (rawKey != candidateKey) {
-        candidateKey = rawKey;
+    if (rawMask != candidateMask || rows != candidateRows || cols != candidateCols ||
+        ghostRisk != candidateGhostRisk) {
+        candidateMask = rawMask;
+        candidateRows = rows;
+        candidateCols = cols;
+        candidateGhostRisk = ghostRisk;
         candidateSince = now;
     }
 
     if (now - candidateSince < KEYPAD_DEBOUNCE_MS) return;
-    if (debouncedKey == candidateKey) return;  // no state change
+    if (debouncedMask == candidateMask) return;  // no state change
 
-    debouncedKey = candidateKey;
+    debouncedMask = candidateMask;
 
     // Only act on press transitions (ignore releases).
-    if (debouncedKey < 0) return;
+    if (debouncedMask == 0) {
+        chordSessionActive = false;
+        chordSuppressLogged = false;
+        return;
+    }
 
-    const char label = keypadLabelFromKeyIndex(debouncedKey);
+    const uint8_t keyCount = countKeyMaskBits(debouncedMask);
+    if (keyCount != 1) {
+        chordSessionActive = true;
+        chordSuppressLogged = false;
+        handleKeypadChord(debouncedMask, candidateGhostRisk);
+        return;
+    }
+
+    if (chordSessionActive) {
+        if (!chordSuppressLogged) {
+            publishDebugMessageAlways("[KeypadChord] single-key transition suppressed until release");
+            chordSuppressLogged = true;
+        }
+        return;
+    }
+
+    const int keyIndex = firstKeyIndexFromMask(debouncedMask);
+    const char label = keypadLabelFromKeyIndex(keyIndex);
     const int  idx   = keypadSelectionIndexFromLabel(label);
 
     {
         // Key presses are user-triggered, so always publish even if debug timed out.
         char msg[96];
-        snprintf(msg, sizeof(msg), "[Keypad] raw=%d label=%c idx=%d", debouncedKey, label, idx);
+        snprintf(msg, sizeof(msg), "[Keypad] raw=%d label=%c idx=%d", keyIndex, label, idx);
         publishDebugMessageAlways(msg);
     }
 

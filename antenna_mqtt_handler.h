@@ -8,8 +8,8 @@
 
 /* ---------- data structures ------------------------------------ */
 struct BandState {                  // NEW
-    String rx;                      // first (or only) RXANTENNAS item
-    String tx;                      // first (or only) TXANTENNAS item
+    std::vector<String> rx;         // RXANTENNAS lineup
+    std::vector<String> tx;         // TXANTENNAS lineup
 };
 
 /* ---------- global caches -------------------------------------- */
@@ -34,13 +34,20 @@ bool publishMatrigsAntennaSetCommand(const char* band,
                                       bool* usedFallback,
                                       char* error,
                                       size_t errorLen);
+bool publishMatrigsAntennaLineupCommand(const char* band,
+                                         const char* bank,
+                                         const std::vector<String>& oldLineup,
+                                         const std::vector<String>& newLineup,
+                                         bool* usedFallback,
+                                         char* error,
+                                         size_t errorLen);
 
 /* ---------------- shared TX-queue support -------------------- */
 struct PendingTxChange {
     String band;
-    String oldAnt;
-    String newAnt;
-    bool   valid;
+    std::vector<String> oldLineup;
+    std::vector<String> newLineup;
+    bool valid = false;
 };
 
 extern bool            g_txActive;   // true while PTT is active

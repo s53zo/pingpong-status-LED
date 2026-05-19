@@ -41,29 +41,73 @@ bool DongutecKeypadMcp23008::begin(TwoWire& wire)
 
 int8_t DongutecKeypadMcp23008::readKeyIndex()
 {
-  if (!_wire) return -2;
+  uint16_t key_mask = 0;
+  if (!readKeyMask(&key_mask)) return -2;
+  if (key_mask == 0) return -1;
+
+  int8_t found = -1;
+  for (int key = 0; key < 16; ++key) {
+    if ((key_mask & (1u << key)) == 0) continue;
+    if (found >= 0) return -3;
+    found = key;
+  }
+
+  return found;
+}
+
+bool DongutecKeypadMcp23008::readKeyMask(uint16_t* key_mask,
+                                         uint8_t* row_mask,
+                                         uint8_t* col_mask,
+                                         bool* ghost_risk)
+{
+  if (!key_mask) return false;
+  *key_mask = 0;
+  if (row_mask) *row_mask = 0;
+  if (col_mask) *col_mask = 0;
+  if (ghost_risk) *ghost_risk = false;
+  if (!_wire) return false;
 
   uint8_t v_hi = 0;
   uint8_t v_lo = 0;
 
   // Phase 1: upper nibble inputs, lower nibble outputs.
-  if (!writeReg(REG_IODIR, 0xF0)) return -2;
+  if (!writeReg(REG_IODIR, 0xF0)) return false;
   delayMicroseconds(50);
-  if (!readReg(REG_GPIO, &v_hi)) return -2;
+  if (!readReg(REG_GPIO, &v_hi)) return false;
 
   // Phase 2: lower nibble inputs, upper nibble outputs.
-  if (!writeReg(REG_IODIR, 0x0F)) return -2;
+  if (!writeReg(REG_IODIR, 0x0F)) return false;
   delayMicroseconds(50);
-  if (!readReg(REG_GPIO, &v_lo)) return -2;
+  if (!readReg(REG_GPIO, &v_lo)) return false;
 
-  uint8_t combined = v_hi | v_lo;
-  if (combined == 0) return -1;
+  uint8_t rows = 0;
+  uint8_t cols = 0;
 
-  const int8_t key = _lookup[combined];
-  if (key >= 0) return key;
+  for (uint8_t row = 0; row < 4; ++row) {
+    const uint8_t row_bit = 1u << (3 - row);
+    if (v_lo & row_bit) rows |= (1u << row);
+  }
 
-  // More than one key (or ghost/ambiguous matrix state).
-  return -3;
+  for (uint8_t col = 0; col < 4; ++col) {
+    const uint8_t col_bit = 16u << (3 - col);
+    if (v_hi & col_bit) cols |= (1u << col);
+  }
+
+  for (uint8_t col = 0; col < 4; ++col) {
+    if ((cols & (1u << col)) == 0) continue;
+    for (uint8_t row = 0; row < 4; ++row) {
+      if ((rows & (1u << row)) == 0) continue;
+      *key_mask |= (1u << (col * 4 + row));
+    }
+  }
+
+  if (row_mask) *row_mask = rows;
+  if (col_mask) *col_mask = cols;
+  if (ghost_risk)
+    *ghost_risk = rows && cols && ((rows & (rows - 1)) != 0) &&
+                  ((cols & (cols - 1)) != 0);
+
+  return true;
 }
 
 bool DongutecKeypadMcp23008::writeReg(uint8_t reg, uint8_t value)

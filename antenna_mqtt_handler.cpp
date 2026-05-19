@@ -44,64 +44,101 @@ DynamicJsonDocument availableDoc(4096);
 /* ── global: band ➜ {rx,tx} cache ─────────────────────────────── */
 std::map<String, BandState> g_bandStates; 
 
-static PendingTxChange s_deferredTxChange = { "", "", "", false };
+static PendingTxChange s_deferredTxChange;
 static uint32_t s_lastDeferredTxAttemptMs = 0;
 static uint32_t s_lastMqtt5FailureMs = 0;
 static constexpr uint32_t DEFERRED_TX_RETRY_MS = 2000;
 static constexpr uint32_t MQTT5_RETRY_DELAY_MS = 10000;
 
-static String makeSingleAntennaJsonArray(const char* antenna)
+static void appendJsonEscaped(String& payload, const char* value)
 {
-    String payload;
-    payload.reserve(strlen(antenna) + 6);
-    payload += F("[\"");
-    for (const char* p = antenna; *p; ++p) {
+    payload += '"';
+    for (const char* p = value; p && *p; ++p) {
         if (*p == '"' || *p == '\\') payload += '\\';
         payload += *p;
     }
-    payload += F("\"]");
+    payload += '"';
+}
+
+static String makeAntennaJsonArray(const std::vector<String>& antennas)
+{
+    size_t reserveLen = 3;
+    for (const auto& antenna : antennas)
+        reserveLen += antenna.length() + 3;
+
+    String payload;
+    payload.reserve(reserveLen);
+    payload += '[';
+    for (size_t i = 0; i < antennas.size(); ++i) {
+        if (i) payload += ',';
+        appendJsonEscaped(payload, antennas[i].c_str());
+    }
+    payload += ']';
     return payload;
 }
 
 static bool publishRemoveAddFallback(const char* band,
                                      const char* bank,
-                                     const char* oldAnt,
-                                     const char* newAnt)
+                                     const std::vector<String>& oldLineup,
+                                     const std::vector<String>& newLineup,
+                                     char* error,
+                                     size_t errorLen)
 {
-    if (!clientMatrigs.connected()) return false;
+    if (!clientMatrigs.connected()) {
+        if (error && errorLen)
+            snprintf(error, errorLen, "remove/add fallback not connected");
+        return false;
+    }
 
-    bool ok = true;
-    if (oldAnt && oldAnt[0]) {
+    for (const auto& oldAnt : oldLineup) {
+        if (!oldAnt.length()) continue;
         char topicR[160];
         snprintf(topicR, sizeof(topicR),
                  "matrigs/0/sta/%s/b/%s/p:remove/%sANTENNAS",
                  station_name, band, bank);
-        ok = clientMatrigs.publish(topicR, oldAnt) && ok;
+        if (!clientMatrigs.publish(topicR, oldAnt.c_str())) {
+            if (error && errorLen)
+                snprintf(error, errorLen, "remove/add fallback failed removing %s",
+                         oldAnt.c_str());
+            clientMatrigs.disconnect();  // force retained band-state resync
+            return false;
+        }
     }
 
-    char topicA[160];
-    snprintf(topicA, sizeof(topicA),
-             "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
-             station_name, band, bank);
-    ok = clientMatrigs.publish(topicA, newAnt) && ok;
+    // MatriGS add_*_antenna() inserts at the front, so replay in reverse
+    // to leave the final broker lineup in the same order as newLineup.
+    for (int i = static_cast<int>(newLineup.size()) - 1; i >= 0; --i) {
+        if (!newLineup[i].length()) continue;
+        char topicA[160];
+        snprintf(topicA, sizeof(topicA),
+                 "matrigs/0/sta/%s/b/%s/p:add/%sANTENNAS",
+                 station_name, band, bank);
+        if (!clientMatrigs.publish(topicA, newLineup[i].c_str())) {
+            if (error && errorLen)
+                snprintf(error, errorLen, "remove/add fallback failed adding %s",
+                         newLineup[i].c_str());
+            clientMatrigs.disconnect();  // force retained band-state resync
+            return false;
+        }
+    }
 
-    return ok;
+    return true;
 }
 
-bool publishMatrigsAntennaSetCommand(const char* band,
-                                     const char* bank,
-                                     const char* oldAnt,
-                                     const char* newAnt,
-                                     bool* usedFallback,
-                                     char* error,
-                                     size_t errorLen)
+bool publishMatrigsAntennaLineupCommand(const char* band,
+                                        const char* bank,
+                                        const std::vector<String>& oldLineup,
+                                        const std::vector<String>& newLineup,
+                                        bool* usedFallback,
+                                        char* error,
+                                        size_t errorLen)
 {
     if (usedFallback) *usedFallback = false;
     if (error && errorLen) error[0] = '\0';
 
-    if (!band || !band[0] || !bank || !bank[0] || !newAnt || !newAnt[0]) {
+    if (!band || !band[0] || !bank || !bank[0] || newLineup.empty()) {
         if (error && errorLen)
-            snprintf(error, errorLen, "missing antenna set argument");
+            snprintf(error, errorLen, "missing antenna lineup argument");
         return false;
     }
 
@@ -113,7 +150,7 @@ bool publishMatrigsAntennaSetCommand(const char* band,
     char clientId[64];
     snprintf(clientId, sizeof(clientId), "PingPong-MGS5-%s", macAddress);
 
-    String payload = makeSingleAntennaJsonArray(newAnt);
+    String payload = makeAntennaJsonArray(newLineup);
     char mqtt5Error[128] = "";
     bool shouldTryMqtt5 =
         s_lastMqtt5FailureMs == 0 ||
@@ -134,7 +171,9 @@ bool publishMatrigsAntennaSetCommand(const char* band,
     }
 
     if (usedFallback) *usedFallback = true;
-    if (publishRemoveAddFallback(band, bank, oldAnt, newAnt)) {
+    char fallbackError[96] = "";
+    if (publishRemoveAddFallback(band, bank, oldLineup, newLineup,
+                                 fallbackError, sizeof(fallbackError))) {
         if (error && errorLen)
             snprintf(error, errorLen, "MQTT5 failed: %s; used remove/add fallback",
                      mqtt5Error);
@@ -142,9 +181,26 @@ bool publishMatrigsAntennaSetCommand(const char* band,
     }
 
     if (error && errorLen)
-        snprintf(error, errorLen, "MQTT5 failed: %s; remove/add fallback failed",
-                 mqtt5Error);
+        snprintf(error, errorLen, "MQTT5 failed: %s; %s",
+                 mqtt5Error, fallbackError[0] ? fallbackError
+                                              : "remove/add fallback failed");
     return false;
+}
+
+bool publishMatrigsAntennaSetCommand(const char* band,
+                                     const char* bank,
+                                     const char* oldAnt,
+                                     const char* newAnt,
+                                     bool* usedFallback,
+                                     char* error,
+                                     size_t errorLen)
+{
+    std::vector<String> oldLineup;
+    std::vector<String> newLineup;
+    if (oldAnt && oldAnt[0]) oldLineup.push_back(String(oldAnt));
+    if (newAnt && newAnt[0]) newLineup.push_back(String(newAnt));
+    return publishMatrigsAntennaLineupCommand(
+        band, bank, oldLineup, newLineup, usedFallback, error, errorLen);
 }
 
 void serviceAntennaMqttTasks()
@@ -160,19 +216,19 @@ void serviceAntennaMqttTasks()
 
     bool usedFallback = false;
     char publishError[160] = "";
-    bool sent = publishMatrigsAntennaSetCommand(
+    bool sent = publishMatrigsAntennaLineupCommand(
         s_deferredTxChange.band.c_str(), "TX",
-        s_deferredTxChange.oldAnt.c_str(), s_deferredTxChange.newAnt.c_str(),
+        s_deferredTxChange.oldLineup, s_deferredTxChange.newLineup,
         &usedFallback, publishError, sizeof(publishError));
 
     if (sent && usedFallback) {
         publishDebugMessage("[TX-Queue] executed queued TX change via remove/add fallback");
-        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newAnt;
+        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newLineup;
         s_deferredTxChange.valid = false;
         s_lastDeferredTxAttemptMs = 0;
     } else if (sent) {
         publishDebugMessage("[TX-Queue] executed queued TX change via MQTT5 p:set");
-        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newAnt;
+        g_bandStates[s_deferredTxChange.band].tx = s_deferredTxChange.newLineup;
         s_deferredTxChange.valid = false;
         s_lastDeferredTxAttemptMs = 0;
     } else {
@@ -297,6 +353,19 @@ String listAntennasForBand(const char* band)
 }
 
 /* ── function: handle “…/sta/<sta>/b/<Band>” JSON  -------------- */
+static void copyJsonArrayToLineup(JsonVariantConst value, std::vector<String>& lineup)
+{
+    lineup.clear();
+    if (!value.is<JsonArrayConst>()) return;
+
+    JsonArrayConst arr = value.as<JsonArrayConst>();
+    for (JsonVariantConst item : arr) {
+        const char* antenna = item.as<const char*>();
+        if (antenna && antenna[0])
+            lineup.push_back(String(antenna));
+    }
+}
+
 void handleBandStateJSON(const char* band, const char* json)       // NEW
 {
     DynamicJsonDocument doc(512);
@@ -304,16 +373,8 @@ void handleBandStateJSON(const char* band, const char* json)       // NEW
 
     BandState& st = g_bandStates[band];              // create or fetch slot
 
-    /* grab first element or reset to empty */
-    if (doc["RXANTENNAS"].is<JsonArray>() && doc["RXANTENNAS"].size() > 0)
-        st.rx = doc["RXANTENNAS"][0].as<const char*>();
-    else
-        st.rx = "";
-
-    if (doc["TXANTENNAS"].is<JsonArray>() && doc["TXANTENNAS"].size() > 0)
-        st.tx = doc["TXANTENNAS"][0].as<const char*>();
-    else
-        st.tx = "";
+    copyJsonArrayToLineup(doc["RXANTENNAS"].as<JsonVariantConst>(), st.rx);
+    copyJsonArrayToLineup(doc["TXANTENNAS"].as<JsonVariantConst>(), st.tx);
 
     // Per-band retained state is not proof that this is the active band.
     // Only the DT feed owns currentBand; /b/<band> refreshes UI/keypad data

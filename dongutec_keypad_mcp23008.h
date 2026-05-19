@@ -21,6 +21,15 @@ public:
   // - -3     : multi-key / ambiguous matrix state
   int8_t readKeyIndex();
 
+  // Diagnostic multi-key scan.
+  // key_mask uses key index bits 0..15 (same indices as readKeyIndex).
+  // row_mask and col_mask use normalized 4-bit row/column sets.
+  // ghost_risk is true when multiple rows and multiple columns are active.
+  bool readKeyMask(uint16_t* key_mask,
+                   uint8_t* row_mask = nullptr,
+                   uint8_t* col_mask = nullptr,
+                   bool* ghost_risk = nullptr);
+
 private:
   bool writeReg(uint8_t reg, uint8_t value);
   bool readReg(uint8_t reg, uint8_t* out);
