@@ -19,7 +19,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v1.47 jul 2025 S53ZO"
+#define VER "v1.48 may2026 S53ZO qos1"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -64,6 +64,7 @@ std::map<String,String> bandCache;    // band ➜ sorted antenna list
 char topic_cmd[128];
 char topic_available[128];
 char topic_dt[128];
+const uint8_t MQTT_SUB_QOS = 1;
 
 // -----------------------------------------------------------------
 //  Debug helper – only speaks when debugEnabled == true
@@ -320,12 +321,6 @@ void setupWiFi()
     snprintf(topic_band_wildcard, sizeof(topic_band_wildcard),
              "%s#", topic_band_prefix);
 
-    /* ---------- subscribe ----------------------------------------- */
-    client.subscribe(command_topic);              // if broker echoes cmds
-    client.subscribe(topic_available);            // antenna catalogue
-    client.subscribe(topic_dt);                   // legacy combined status
-    client.subscribe(topic_band_wildcard);        // live per-band JSON
-
     /* ---------- console summary ----------------------------------- */
     Serial.print("Command topic: ");  Serial.println(command_topic);
     Serial.print("Feedback topic: "); Serial.println(feedback_topic);
@@ -534,6 +529,15 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 }
 
+static bool subscribeMqttTopic(const char* topic) {
+  bool ok = client.subscribe(topic, MQTT_SUB_QOS);
+  snprintf(logBuffer, sizeof(logBuffer), "%s requested QoS %u: %s",
+           ok ? "Subscribe sent with" : "Subscribe failed with",
+           MQTT_SUB_QOS, topic);
+  publishDebugMessage(logBuffer);
+  return ok;
+}
+
 // --- MQTT reconnect ---
 void reconnectMQTT() {
   if (!client.connected()) {
@@ -555,19 +559,17 @@ void reconnectMQTT() {
       mqttHelloStart   = millis();
 
 
-      char topic_cmd[128], topic1[128], topic2[128];
+      char topic_cmd[128], topic1[128], topic2[128], topic3[128];
       strncpy(topic_cmd, command_topic, sizeof(topic_cmd));
+      topic_cmd[sizeof(topic_cmd) - 1] = '\0';
       snprintf(topic1, sizeof(topic1), "matrigs/0/sta/%s/available", station_name);
       snprintf(topic2, sizeof(topic2), "matrigs/0/dt/RTX/d/%s", station_name);
+      snprintf(topic3, sizeof(topic3), "matrigs/0/sta/%s/b/#", station_name);
 
-      client.subscribe(topic_cmd);
-      client.subscribe(topic1);
-      client.subscribe(topic2);
-
-      snprintf(logBuffer, sizeof(logBuffer), "Subscribed to command topic: %s", topic_cmd);
-      publishDebugMessage(logBuffer);
-      snprintf(logBuffer, sizeof(logBuffer), "Subscribed to: %s and %s", topic1, topic2);
-      publishDebugMessage(logBuffer);
+      subscribeMqttTopic(topic_cmd);
+      subscribeMqttTopic(topic1);
+      subscribeMqttTopic(topic2);
+      subscribeMqttTopic(topic3);
 
       snprintf(logBuffer, sizeof(logBuffer), "Hello %s", VER);
       char feedbackTopic[100];
