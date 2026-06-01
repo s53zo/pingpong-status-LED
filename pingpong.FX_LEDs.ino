@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.21 may2026 chord"
+#define VER "v2.22 may2026 chord qos1"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -99,6 +99,7 @@ char topic_cmd[128];
 char topic_station_state[128];
 char topic_available[128];
 char topic_dt[128];
+const uint8_t MQTT_SUB_QOS = 1;
 
 // Forward declarations (used in MQTT callback)
 static void enableDebugFor1Minute(const char* source);
@@ -653,6 +654,24 @@ void callback(char* topic, byte* payload, unsigned int length)
     }
 }
 
+static bool subscribeCmdTopic(const char* topic) {
+  bool ok = clientCmd.subscribe(topic, MQTT_SUB_QOS);
+  snprintf(logBuffer, sizeof(logBuffer), "%s requested QoS %u: %s",
+           ok ? "Subscribe sent with" : "Subscribe failed with",
+           MQTT_SUB_QOS, topic);
+  Serial.println(logBuffer);
+  return ok;
+}
+
+static bool subscribeMatrigsTopic(const char* topic) {
+  bool ok = clientMatrigs.subscribe(topic, MQTT_SUB_QOS);
+  snprintf(logBuffer, sizeof(logBuffer), "%s requested QoS %u: %s",
+           ok ? "Subscribe sent with" : "Subscribe failed with",
+           MQTT_SUB_QOS, topic);
+  Serial.println(logBuffer);
+  return ok;
+}
+
 // --- MQTT reconnect (Pingpong broker: LED commands + debug) ---
 static void reconnectMqttCmd()
 {
@@ -676,7 +695,7 @@ static void reconnectMqttCmd()
   mqttHelloRunning = true;
   mqttHelloStart   = millis();
 
-  clientCmd.subscribe(command_topic);
+  subscribeCmdTopic(command_topic);
 
   // Keypad status is useful even when debug is disabled, so publish it
   // directly to the debug topic after MQTT connects.
@@ -707,10 +726,10 @@ static void reconnectMqttMatrigs()
 
   publishDebugMessage("[MQTT] MatriGS connected");
 
-  clientMatrigs.subscribe(topic_station_state);
-  clientMatrigs.subscribe(topic_available);
-  clientMatrigs.subscribe(topic_dt);
-  clientMatrigs.subscribe(topic_band_wildcard);
+  subscribeMatrigsTopic(topic_station_state);
+  subscribeMatrigsTopic(topic_available);
+  subscribeMatrigsTopic(topic_dt);
+  subscribeMatrigsTopic(topic_band_wildcard);
 }
 
 /* ================================================================
