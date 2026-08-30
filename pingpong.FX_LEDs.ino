@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.25 aug2026 chord roam"
+#define VER "v2.26 aug2026 chord roam"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -68,6 +68,18 @@ uint16_t wifi_roam_scan_sec = 60;  // 0 disables AP roaming scans
 int16_t wifi_roam_rssi_dbm = -70;  // scan only when current AP is weaker
 char logBuffer[256];
 char g_wifiRoamStatus[160] = "not scanned yet";
+
+static constexpr uint8_t WIFI_SCAN_STATUS_MAX_APS = 12;
+struct WifiScanStatus {
+  char ssid[33];
+  char bssid[18];
+  int16_t rssi;
+  int8_t channel;
+  bool current;
+};
+WifiScanStatus g_wifiScanStatus[WIFI_SCAN_STATUS_MAX_APS];
+uint8_t g_wifiScanStatusCount = 0;
+unsigned long g_wifiScanStatusAt = 0;
 
 char macAddress[18]     = "";          
 char command_topic[64]  = "";
@@ -272,6 +284,30 @@ void handleRoot()
   snprintf(line, sizeof(line),
            "<li>WiFi roam last: %s</li>", g_wifiRoamStatus);
   server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>WiFi scan APs: %u", g_wifiScanStatusCount);
+  server.sendContent(line);
+  if (g_wifiScanStatusAt) {
+    snprintf(line, sizeof(line), " (%lus ago)",
+             (millis() - g_wifiScanStatusAt) / 1000UL);
+    server.sendContent(line);
+  }
+  server.sendContent("</li>");
+
+  if (g_wifiScanStatusCount) {
+    server.sendContent("<li>WiFi scan signals:<ul>");
+    for (uint8_t i = 0; i < g_wifiScanStatusCount; ++i) {
+      const WifiScanStatus& ap = g_wifiScanStatus[i];
+      snprintf(line, sizeof(line),
+               "<li>%s%s: %d dBm, ch%d, <code>%s</code></li>",
+               ap.current ? "* " : "",
+               ap.ssid[0] ? ap.ssid : "(hidden)",
+               ap.rssi, ap.channel, ap.bssid);
+      server.sendContent(line);
+    }
+    server.sendContent("</ul></li>");
+  }
 
   if (g_keypadPresent) {
     snprintf(line, sizeof(line),
@@ -500,6 +536,50 @@ static void formatBssid(const uint8_t* bssid, char* out, size_t outLen) {
            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
 }
 
+static void clearWifiScanStatus() {
+  g_wifiScanStatusCount = 0;
+  g_wifiScanStatusAt = millis();
+}
+
+static void rememberWifiScanAp(const String& apSsid, const uint8_t* bssid,
+                               int16_t rssi, int8_t channel,
+                               const uint8_t* currentBssid) {
+  uint8_t slot = g_wifiScanStatusCount;
+
+  if (slot >= WIFI_SCAN_STATUS_MAX_APS) {
+    int weakest = g_wifiScanStatus[0].rssi;
+    slot = 0;
+    for (uint8_t i = 1; i < WIFI_SCAN_STATUS_MAX_APS; ++i) {
+      if (g_wifiScanStatus[i].rssi < weakest) {
+        weakest = g_wifiScanStatus[i].rssi;
+        slot = i;
+      }
+    }
+    if (rssi <= weakest) return;
+  } else {
+    g_wifiScanStatusCount++;
+  }
+
+  WifiScanStatus& ap = g_wifiScanStatus[slot];
+  apSsid.substring(0, sizeof(ap.ssid) - 1).toCharArray(ap.ssid, sizeof(ap.ssid));
+  formatBssid(bssid, ap.bssid, sizeof(ap.bssid));
+  ap.rssi = rssi;
+  ap.channel = channel;
+  ap.current = sameBssid(bssid, currentBssid);
+}
+
+static void sortWifiScanStatusBySignal() {
+  for (uint8_t i = 1; i < g_wifiScanStatusCount; ++i) {
+    WifiScanStatus item = g_wifiScanStatus[i];
+    int j = i - 1;
+    while (j >= 0 && g_wifiScanStatus[j].rssi < item.rssi) {
+      g_wifiScanStatus[j + 1] = g_wifiScanStatus[j];
+      j--;
+    }
+    g_wifiScanStatus[j + 1] = item;
+  }
+}
+
 static void maybeRoamToStrongerAp() {
   if (wifi_roam_scan_sec == 0) return;
   if (WiFi.status() != WL_CONNECTED || WiFi.getMode() != WIFI_STA) return;
@@ -528,6 +608,7 @@ static void maybeRoamToStrongerAp() {
   bool haveBetter = false;
 
   int networkCount = WiFi.scanNetworks(false, true);
+  clearWifiScanStatus();
   if (networkCount <= 0) {
     snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
              "scan found no networks, RSSI %d dBm", currentRssi);
@@ -536,12 +617,14 @@ static void maybeRoamToStrongerAp() {
   }
 
   for (int i = 0; i < networkCount; ++i) {
-    if (WiFi.SSID(i) != ssid) continue;
-
     uint8_t* candidateBssid = WiFi.BSSID(i);
+    int candidateRssi = WiFi.RSSI(i);
+    rememberWifiScanAp(WiFi.SSID(i), candidateBssid, candidateRssi,
+                       WiFi.channel(i), currentBssid);
+
+    if (WiFi.SSID(i) != ssid) continue;
     if (sameBssid(candidateBssid, currentBssid)) continue;
 
-    int candidateRssi = WiFi.RSSI(i);
     if (candidateRssi > bestRssi) {
       bestRssi = candidateRssi;
       bestChannel = WiFi.channel(i);
@@ -549,6 +632,7 @@ static void maybeRoamToStrongerAp() {
       haveBetter = true;
     }
   }
+  sortWifiScanStatusBySignal();
 
   WiFi.scanDelete();
 
