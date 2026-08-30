@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.22 may2026 chord qos1"
+#define VER "v2.24 aug2026 chord roam"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -55,6 +55,7 @@ static constexpr int EEPROM_OFF_STATION       = 108;  // char[32]
 static constexpr int EEPROM_OFF_MATRIGS_SERVER = 140; // char[40]
 static constexpr int EEPROM_OFF_MATRIGS_PORT   = 180; // int
 static constexpr int EEPROM_OFF_MAGIC          = 200; // uint32_t
+static constexpr int EEPROM_OFF_WIFI_ROAM_SCAN_SEC = 204; // uint16_t
 static constexpr uint32_t EEPROM_MAGIC_V2      = 0x50494E47; // "PING" marker
 
 // Buffers
@@ -62,7 +63,9 @@ char ssid[32], password[32], mqtt_server[40], station_name[32];
 int mqtt_port = 1883;  // Pingpong broker port
 char matrigs_server[40] = "";
 int  matrigs_port = 4883;  // MatriGS default (can be overridden in web UI)
+uint16_t wifi_roam_scan_sec = 60;  // 0 disables AP roaming scans
 char logBuffer[256];
+char g_wifiRoamStatus[160] = "not scanned yet";
 
 char macAddress[18]     = "";          
 char command_topic[64]  = "";
@@ -100,6 +103,13 @@ char topic_station_state[128];
 char topic_available[128];
 char topic_dt[128];
 const uint8_t MQTT_SUB_QOS = 1;
+static constexpr uint16_t WIFI_ROAM_DEFAULT_SCAN_SEC = 60;
+static constexpr uint16_t WIFI_ROAM_MIN_SCAN_SEC = 30;
+static constexpr uint16_t WIFI_ROAM_MAX_SCAN_SEC = 3600;
+static constexpr int WIFI_ROAM_POOR_RSSI_DBM = -70;
+static constexpr int WIFI_ROAM_MIN_GAIN_DB = 10;
+static constexpr uint32_t WIFI_ROAM_CONNECT_TIMEOUT_MS = 8000;
+static unsigned long g_lastWifiRoamScan = 0;
 
 // Forward declarations (used in MQTT callback)
 static void enableDebugFor1Minute(const char* source);
@@ -206,8 +216,10 @@ void handleRoot()
            "MatriGS MQTT Server IP:<br><input name='matrigs_server' type='text' value='%s'><br>"
            "MatriGS MQTT Port:<br><input name='matrigs_port' type='number' value='%d'><br>"
            "Station Name (RTX-XX):<br><input name='station_name' type='text' value='%s'><br>"
+           "WiFi roam scan interval seconds (0=off):<br><input name='wifi_roam_scan_sec' type='number' value='%u'><br>"
            "<input type='submit' value='Save & Reboot'></form>",
-           ssid, password, mqtt_server, mqtt_port, matrigs_server, matrigs_port, station_name);
+           ssid, password, mqtt_server, mqtt_port, matrigs_server, matrigs_port,
+           station_name, wifi_roam_scan_sec);
   server.sendContent(form);
 
   /* --- status list --- */
@@ -232,6 +244,24 @@ void handleRoot()
 
   snprintf(line, sizeof(line),
            "<li>MatriGS MQTT: <code>%s:%d</code></li>", matrigs_server, matrigs_port);
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>WiFi: RSSI %d dBm, channel %d, BSSID <code>%s</code></li>",
+           WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+           WiFi.status() == WL_CONNECTED ? WiFi.channel() : 0,
+           WiFi.status() == WL_CONNECTED ? WiFi.BSSIDstr().c_str() : "-");
+  server.sendContent(line);
+
+  if (wifi_roam_scan_sec) {
+    snprintf(line, sizeof(line), "<li>WiFi roam scan: %us</li>", wifi_roam_scan_sec);
+  } else {
+    snprintf(line, sizeof(line), "<li>WiFi roam scan: OFF</li>");
+  }
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>WiFi roam last: %s</li>", g_wifiRoamStatus);
   server.sendContent(line);
 
   if (g_keypadPresent) {
@@ -313,6 +343,17 @@ void handleSave() {
   strncpy(matrigs_server, server.arg("matrigs_server").c_str(), sizeof(matrigs_server));
   matrigs_port = server.arg("matrigs_port").toInt();
   strncpy(station_name, server.arg("station_name").c_str(), sizeof(station_name));
+  ssid[sizeof(ssid) - 1] = '\0';
+  password[sizeof(password) - 1] = '\0';
+  mqtt_server[sizeof(mqtt_server) - 1] = '\0';
+  matrigs_server[sizeof(matrigs_server) - 1] = '\0';
+  station_name[sizeof(station_name) - 1] = '\0';
+  wifi_roam_scan_sec = (uint16_t)server.arg("wifi_roam_scan_sec").toInt();
+  if (wifi_roam_scan_sec > 0 && wifi_roam_scan_sec < WIFI_ROAM_MIN_SCAN_SEC) {
+    wifi_roam_scan_sec = WIFI_ROAM_MIN_SCAN_SEC;
+  } else if (wifi_roam_scan_sec > WIFI_ROAM_MAX_SCAN_SEC) {
+    wifi_roam_scan_sec = WIFI_ROAM_MAX_SCAN_SEC;
+  }
 
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(EEPROM_OFF_SSID, ssid);
@@ -323,6 +364,7 @@ void handleSave() {
 
   EEPROM.put(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
   EEPROM.put(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
+  EEPROM.put(EEPROM_OFF_WIFI_ROAM_SCAN_SEC, wifi_roam_scan_sec);
   EEPROM.put(EEPROM_OFF_MAGIC, EEPROM_MAGIC_V2);
   EEPROM.commit();
   EEPROM.end();
@@ -425,6 +467,131 @@ void setupWiFi()
 #endif
 }
 
+static bool sameBssid(const uint8_t* a, const uint8_t* b) {
+  if (!a || !b) return false;
+  for (uint8_t i = 0; i < 6; ++i) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+static void formatBssid(const uint8_t* bssid, char* out, size_t outLen) {
+  if (!bssid || !out || outLen < 18) {
+    if (out && outLen) out[0] = '\0';
+    return;
+  }
+  snprintf(out, outLen, "%02X:%02X:%02X:%02X:%02X:%02X",
+           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+}
+
+static void maybeRoamToStrongerAp() {
+  if (wifi_roam_scan_sec == 0) return;
+  if (WiFi.status() != WL_CONNECTED || WiFi.getMode() != WIFI_STA) return;
+  if (mqttHelloRunning || g_txActive) return;
+
+  unsigned long now = millis();
+  unsigned long intervalMs = (unsigned long)wifi_roam_scan_sec * 1000UL;
+  if (g_lastWifiRoamScan && (now - g_lastWifiRoamScan < intervalMs)) return;
+  g_lastWifiRoamScan = now;
+
+  int currentRssi = WiFi.RSSI();
+  if (currentRssi >= WIFI_ROAM_POOR_RSSI_DBM) {
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "RSSI OK (%d dBm), no scan", currentRssi);
+    return;
+  }
+  if (!ssid[0]) return;
+
+  uint8_t currentBssid[6];
+  memcpy(currentBssid, WiFi.BSSID(), sizeof(currentBssid));
+
+  int bestRssi = currentRssi;
+  int32_t bestChannel = 0;
+  uint8_t bestBssid[6] = {0};
+  bool haveBetter = false;
+
+  int networkCount = WiFi.scanNetworks(false, true);
+  if (networkCount <= 0) {
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "scan found no networks, RSSI %d dBm", currentRssi);
+    WiFi.scanDelete();
+    return;
+  }
+
+  for (int i = 0; i < networkCount; ++i) {
+    if (WiFi.SSID(i) != ssid) continue;
+
+    uint8_t* candidateBssid = WiFi.BSSID(i);
+    if (sameBssid(candidateBssid, currentBssid)) continue;
+
+    int candidateRssi = WiFi.RSSI(i);
+    if (candidateRssi > bestRssi) {
+      bestRssi = candidateRssi;
+      bestChannel = WiFi.channel(i);
+      memcpy(bestBssid, candidateBssid, sizeof(bestBssid));
+      haveBetter = true;
+    }
+  }
+
+  WiFi.scanDelete();
+
+  if (!haveBetter) {
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "scan %d APs, no alternate %s stronger than %d dBm",
+             networkCount, ssid, currentRssi);
+    return;
+  }
+
+  int gainDb = bestRssi - currentRssi;
+  if (gainDb < WIFI_ROAM_MIN_GAIN_DB) {
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "scan %d APs, best gain %d dB below %d dB threshold",
+             networkCount, gainDb, WIFI_ROAM_MIN_GAIN_DB);
+    return;
+  }
+
+  char oldBssidText[18], newBssidText[18];
+  formatBssid(currentBssid, oldBssidText, sizeof(oldBssidText));
+  formatBssid(bestBssid, newBssidText, sizeof(newBssidText));
+  snprintf(logBuffer, sizeof(logBuffer),
+           "[WiFiRoam] %d dBm %s -> %d dBm %s ch%ld",
+           currentRssi, oldBssidText, bestRssi, newBssidText, (long)bestChannel);
+  publishDebugMessageAlways(logBuffer);
+
+  if (clientCmd.connected()) clientCmd.disconnect();
+  if (clientMatrigs.connected()) clientMatrigs.disconnect();
+
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.begin(ssid, password, bestChannel, bestBssid);
+
+  uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < WIFI_ROAM_CONNECT_TIMEOUT_MS) {
+    ws2812fx.service();
+    server.handleClient();
+    delay(100);
+    yield();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(logBuffer, sizeof(logBuffer),
+             "[WiFiRoam] connected RSSI %d dBm BSSID %s",
+             WiFi.RSSI(), WiFi.BSSIDstr().c_str());
+    publishDebugMessageAlways(logBuffer);
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "roamed %s -> %s, RSSI %d -> %d dBm",
+             oldBssidText, newBssidText, currentRssi, WiFi.RSSI());
+  } else {
+    snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
+             "roam to %s failed, reconnecting by SSID", newBssidText);
+    publishDebugMessageAlways("[WiFiRoam] target AP failed, reconnecting by SSID");
+    WiFi.disconnect(false);
+    delay(100);
+    WiFi.begin(ssid, password);
+  }
+}
+
 
 // --- AP Mode Setup ---
 void setupAP() {
@@ -455,11 +622,14 @@ void loadConfigFromEEPROM() {
   if (magic == EEPROM_MAGIC_V2) {
     EEPROM.get(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
     EEPROM.get(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
+    EEPROM.get(EEPROM_OFF_WIFI_ROAM_SCAN_SEC, wifi_roam_scan_sec);
     matrigs_server[sizeof(matrigs_server) - 1] = '\0';
   } else {
     // Backward compat: old configs only had one broker.
     strncpy(matrigs_server, mqtt_server, sizeof(matrigs_server));
+    matrigs_server[sizeof(matrigs_server) - 1] = '\0';
     matrigs_port = 4883;  // MatriGS default port in most installs
+    wifi_roam_scan_sec = WIFI_ROAM_DEFAULT_SCAN_SEC;
   }
 
   // Sanity defaults
@@ -467,6 +637,10 @@ void loadConfigFromEEPROM() {
     strncpy(matrigs_server, mqtt_server, sizeof(matrigs_server));
   if (matrigs_port <= 0 || matrigs_port > 65535)
     matrigs_port = 4883;
+  if (wifi_roam_scan_sec == 0xFFFF || wifi_roam_scan_sec > WIFI_ROAM_MAX_SCAN_SEC)
+    wifi_roam_scan_sec = WIFI_ROAM_DEFAULT_SCAN_SEC;
+  if (wifi_roam_scan_sec > 0 && wifi_roam_scan_sec < WIFI_ROAM_MIN_SCAN_SEC)
+    wifi_roam_scan_sec = WIFI_ROAM_MIN_SCAN_SEC;
 
   EEPROM.end();
 
@@ -475,6 +649,7 @@ void loadConfigFromEEPROM() {
   Serial.printf("Read Pingpong MQTT: %s:%d\n", mqtt_server, mqtt_port);
   Serial.printf("Read MatriGS MQTT:  %s:%d\n", matrigs_server, matrigs_port);
   Serial.printf("Read Station Name: %s\n", station_name);
+  Serial.printf("Read WiFi roam scan: %us\n", wifi_roam_scan_sec);
 }
 
 // --- FX Command Parser ---
@@ -1313,4 +1488,6 @@ void loop() {
     reconnectMqttCmd();
     reconnectMqttMatrigs();
   }
+
+  maybeRoamToStrongerAp();
 }
