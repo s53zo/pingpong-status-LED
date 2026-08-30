@@ -25,7 +25,7 @@ ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
 // Constants
-#define VER "v2.24 aug2026 chord roam"
+#define VER "v2.25 aug2026 chord roam"
 #define LED_PIN D3
 #define NUM_LEDS 4
 #define AP_SSID "ESP8266_Setup"
@@ -56,6 +56,7 @@ static constexpr int EEPROM_OFF_MATRIGS_SERVER = 140; // char[40]
 static constexpr int EEPROM_OFF_MATRIGS_PORT   = 180; // int
 static constexpr int EEPROM_OFF_MAGIC          = 200; // uint32_t
 static constexpr int EEPROM_OFF_WIFI_ROAM_SCAN_SEC = 204; // uint16_t
+static constexpr int EEPROM_OFF_WIFI_ROAM_RSSI_DBM = 206; // int16_t
 static constexpr uint32_t EEPROM_MAGIC_V2      = 0x50494E47; // "PING" marker
 
 // Buffers
@@ -64,6 +65,7 @@ int mqtt_port = 1883;  // Pingpong broker port
 char matrigs_server[40] = "";
 int  matrigs_port = 4883;  // MatriGS default (can be overridden in web UI)
 uint16_t wifi_roam_scan_sec = 60;  // 0 disables AP roaming scans
+int16_t wifi_roam_rssi_dbm = -70;  // scan only when current AP is weaker
 char logBuffer[256];
 char g_wifiRoamStatus[160] = "not scanned yet";
 
@@ -106,7 +108,9 @@ const uint8_t MQTT_SUB_QOS = 1;
 static constexpr uint16_t WIFI_ROAM_DEFAULT_SCAN_SEC = 60;
 static constexpr uint16_t WIFI_ROAM_MIN_SCAN_SEC = 30;
 static constexpr uint16_t WIFI_ROAM_MAX_SCAN_SEC = 3600;
-static constexpr int WIFI_ROAM_POOR_RSSI_DBM = -70;
+static constexpr int16_t WIFI_ROAM_DEFAULT_RSSI_DBM = -70;
+static constexpr int16_t WIFI_ROAM_MIN_RSSI_DBM = -95;
+static constexpr int16_t WIFI_ROAM_MAX_RSSI_DBM = -45;
 static constexpr int WIFI_ROAM_MIN_GAIN_DB = 10;
 static constexpr uint32_t WIFI_ROAM_CONNECT_TIMEOUT_MS = 8000;
 static unsigned long g_lastWifiRoamScan = 0;
@@ -206,7 +210,7 @@ void handleRoot()
   send_P(PAGE_HEAD);
 
   /* --- full <form> in one go (needs ~350 B worst-case) --- */
-  char form[768];   // plenty of head-room
+  char form[896];   // plenty of head-room
   snprintf(form, sizeof(form),
            "<form action='/save' method='post'>"
            "SSID:<br><input name='ssid' type='text' value='%s'><br>"
@@ -217,9 +221,10 @@ void handleRoot()
            "MatriGS MQTT Port:<br><input name='matrigs_port' type='number' value='%d'><br>"
            "Station Name (RTX-XX):<br><input name='station_name' type='text' value='%s'><br>"
            "WiFi roam scan interval seconds (0=off):<br><input name='wifi_roam_scan_sec' type='number' value='%u'><br>"
+           "WiFi roam RSSI threshold dBm:<br><input name='wifi_roam_rssi_dbm' type='number' value='%d'><br>"
            "<input type='submit' value='Save & Reboot'></form>",
            ssid, password, mqtt_server, mqtt_port, matrigs_server, matrigs_port,
-           station_name, wifi_roam_scan_sec);
+           station_name, wifi_roam_scan_sec, wifi_roam_rssi_dbm);
   server.sendContent(form);
 
   /* --- status list --- */
@@ -258,6 +263,10 @@ void handleRoot()
   } else {
     snprintf(line, sizeof(line), "<li>WiFi roam scan: OFF</li>");
   }
+  server.sendContent(line);
+
+  snprintf(line, sizeof(line),
+           "<li>WiFi roam threshold: %d dBm</li>", wifi_roam_rssi_dbm);
   server.sendContent(line);
 
   snprintf(line, sizeof(line),
@@ -354,6 +363,12 @@ void handleSave() {
   } else if (wifi_roam_scan_sec > WIFI_ROAM_MAX_SCAN_SEC) {
     wifi_roam_scan_sec = WIFI_ROAM_MAX_SCAN_SEC;
   }
+  wifi_roam_rssi_dbm = (int16_t)server.arg("wifi_roam_rssi_dbm").toInt();
+  if (wifi_roam_rssi_dbm < WIFI_ROAM_MIN_RSSI_DBM) {
+    wifi_roam_rssi_dbm = WIFI_ROAM_MIN_RSSI_DBM;
+  } else if (wifi_roam_rssi_dbm > WIFI_ROAM_MAX_RSSI_DBM) {
+    wifi_roam_rssi_dbm = WIFI_ROAM_MAX_RSSI_DBM;
+  }
 
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(EEPROM_OFF_SSID, ssid);
@@ -365,6 +380,7 @@ void handleSave() {
   EEPROM.put(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
   EEPROM.put(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
   EEPROM.put(EEPROM_OFF_WIFI_ROAM_SCAN_SEC, wifi_roam_scan_sec);
+  EEPROM.put(EEPROM_OFF_WIFI_ROAM_RSSI_DBM, wifi_roam_rssi_dbm);
   EEPROM.put(EEPROM_OFF_MAGIC, EEPROM_MAGIC_V2);
   EEPROM.commit();
   EEPROM.end();
@@ -495,9 +511,10 @@ static void maybeRoamToStrongerAp() {
   g_lastWifiRoamScan = now;
 
   int currentRssi = WiFi.RSSI();
-  if (currentRssi >= WIFI_ROAM_POOR_RSSI_DBM) {
+  if (currentRssi >= wifi_roam_rssi_dbm) {
     snprintf(g_wifiRoamStatus, sizeof(g_wifiRoamStatus),
-             "RSSI OK (%d dBm), no scan", currentRssi);
+             "RSSI OK (%d dBm >= %d dBm), no scan",
+             currentRssi, wifi_roam_rssi_dbm);
     return;
   }
   if (!ssid[0]) return;
@@ -623,6 +640,7 @@ void loadConfigFromEEPROM() {
     EEPROM.get(EEPROM_OFF_MATRIGS_SERVER, matrigs_server);
     EEPROM.get(EEPROM_OFF_MATRIGS_PORT, matrigs_port);
     EEPROM.get(EEPROM_OFF_WIFI_ROAM_SCAN_SEC, wifi_roam_scan_sec);
+    EEPROM.get(EEPROM_OFF_WIFI_ROAM_RSSI_DBM, wifi_roam_rssi_dbm);
     matrigs_server[sizeof(matrigs_server) - 1] = '\0';
   } else {
     // Backward compat: old configs only had one broker.
@@ -630,6 +648,7 @@ void loadConfigFromEEPROM() {
     matrigs_server[sizeof(matrigs_server) - 1] = '\0';
     matrigs_port = 4883;  // MatriGS default port in most installs
     wifi_roam_scan_sec = WIFI_ROAM_DEFAULT_SCAN_SEC;
+    wifi_roam_rssi_dbm = WIFI_ROAM_DEFAULT_RSSI_DBM;
   }
 
   // Sanity defaults
@@ -641,6 +660,9 @@ void loadConfigFromEEPROM() {
     wifi_roam_scan_sec = WIFI_ROAM_DEFAULT_SCAN_SEC;
   if (wifi_roam_scan_sec > 0 && wifi_roam_scan_sec < WIFI_ROAM_MIN_SCAN_SEC)
     wifi_roam_scan_sec = WIFI_ROAM_MIN_SCAN_SEC;
+  if (wifi_roam_rssi_dbm < WIFI_ROAM_MIN_RSSI_DBM ||
+      wifi_roam_rssi_dbm > WIFI_ROAM_MAX_RSSI_DBM)
+    wifi_roam_rssi_dbm = WIFI_ROAM_DEFAULT_RSSI_DBM;
 
   EEPROM.end();
 
@@ -650,6 +672,7 @@ void loadConfigFromEEPROM() {
   Serial.printf("Read MatriGS MQTT:  %s:%d\n", matrigs_server, matrigs_port);
   Serial.printf("Read Station Name: %s\n", station_name);
   Serial.printf("Read WiFi roam scan: %us\n", wifi_roam_scan_sec);
+  Serial.printf("Read WiFi roam threshold: %d dBm\n", wifi_roam_rssi_dbm);
 }
 
 // --- FX Command Parser ---
